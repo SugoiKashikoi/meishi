@@ -226,9 +226,8 @@ if (!app.requestSingleInstanceLock()) {
     session.defaultSession.webRequest.onBeforeRequest((d, cb) => {
       cb({ cancel: !/^(app|blob|data|devtools|chrome-extension):/i.test(d.url) });
     });
-    // 権限はクリップボードへの書き込み（ChatGPT 用に指示文・画像をコピー）だけ許可。カメラ・マイク・位置情報などは拒否
-    session.defaultSession.setPermissionRequestHandler((_wc, perm, cb) => cb(perm === 'clipboard-sanitized-write'));
-    session.defaultSession.setPermissionCheckHandler((_wc, perm) => perm === 'clipboard-sanitized-write');
+    // カメラ・マイク・位置情報・クリップボードなどの権限要求はすべて拒否
+    session.defaultSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
     protocol.handle(SCHEME, (req) => handleProtocol(req).catch((e) => Response.json({ error: (e as Error).message }, { status: 500 })));
     if (app.isPackaged) setLogFile(path.join(app.getPath('userData'), 'logs', 'meishi.log'));
     defaults = loadDefaults([path.join(path.dirname(app.getPath('exe')), 'meishi-config.json'), path.join(ROOT, 'meishi-config.json')]);

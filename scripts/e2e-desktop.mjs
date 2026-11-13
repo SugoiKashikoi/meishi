@@ -75,22 +75,6 @@ if (await w.locator('text=文字を読み取る').count()) {
   step(`PC1: OCR ${((Date.now() - t0) / 1000).toFixed(1)}秒 候補 ${JSON.stringify(vals)}`);
   await w.click('text=選択した項目を入力欄に反映');
 }
-// ChatGPT 読み取り（コピー＆ペースト）：指示文・画像がクリップボードに入り、回答の JSON を貼ると候補になる
-await w.click('text=ChatGPTで読み取る');
-await w.click('text=指示文をコピー');
-await w.waitForTimeout(300);
-const clipText = await pc1.app.evaluate(({ clipboard }) => clipboard.readText());
-if (!clipText.includes('"company"')) throw new Error('指示文がコピーされていない');
-await w.click('text=表面の画像をコピー');
-await w.waitForTimeout(800);
-const clipImg = await pc1.app.evaluate(({ clipboard }) => clipboard.readImage().getSize());
-if (!clipImg.width) throw new Error('画像がコピーされていない');
-await w.fill('.ai-read textarea', '読み取り結果です。\n```json\n{"company":"架空商事株式会社","department":"営業部","title":"部長","name":"見本 次郎","kana":"みほん じろう","email":"jiro@example.invalid","phone":"03-0000-1234"}\n```');
-await w.click('text=回答を読み込んで候補を表示');
-await w.waitForSelector('text=読み取り結果（入力候補）');
-await w.click('text=選択した項目を入力欄に反映');
-if ((await w.inputValue('#f-kana')) !== 'みほん じろう') throw new Error('ChatGPT の回答が反映されていない');
-step(`PC1: ChatGPT 用に指示文・画像（${clipImg.width}x${clipImg.height}）をコピー → 回答を貼り付けて候補を反映`);
 await w.fill('#f-company', '架空商事株式会社');
 await w.fill('#f-name', '見本 次郎');
 await w.fill('#f-memo', '展示会で新製品の説明を受けた');

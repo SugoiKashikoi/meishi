@@ -1,5 +1,5 @@
 // 名刺管理 フロントエンド（外部ライブラリなし。データはブラウザに永続保存しない）
-import { runOcr, parseCardText, OcrCandidates, AI_PROMPT, parseAiAnswer } from './ocr.js';
+import { runOcr, parseCardText, OcrCandidates } from './ocr.js';
 
 // ---------------- 型 ----------------
 const CATS: [string, string][] = [['customer', '顧客'], ['prospect', '見込み客'], ['supplier', '仕入先'], ['partner', '協力会社'], ['other', 'その他']];
@@ -384,7 +384,6 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
         s.preview ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => void rotate(k) }, '↻ 回転') : null,
         s.preview ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => { if (confirm('この画像を外しますか？（保存するまで確定しません）')) { Object.assign(s, { id: null, source: null, preview: null, state: 'idle', msg: '', processed: null }); dirty = true; renderSlot(k); } } }, '削除') : null,
         k === 'frontImage' && s.preview && status?.ocrAvailable ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => void ocr() }, '文字を読み取る') : null,
-        k === 'frontImage' && s.preview ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => aiRead() }, 'ChatGPTで読み取る') : null,
         s.state === 'err' && s.processed ? h('button', { type: 'button', class: 'btn btn-sm btn-primary', onclick: () => void upload(k) }, '再試行') : null),
       h('div', { class: `st ${s.state}`, hidden: !s.msg }, s.msg));
   };
@@ -461,49 +460,6 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
     } catch (e) {
       ocrBox.replaceChildren(h('div', { class: 'error-box' }, `読み取りに失敗しました：${(e as Error).message}。手入力で登録できます。`));
     }
-  };
-  /**
-   * ChatGPT 等での読み取り：指示文と画像をクリップボードにコピー → 利用者が ChatGPT に貼って送信 → 回答を貼り付け。
-   * アプリ自体は外部へ何も送らない。送るかどうか・何を送るかは利用者がその都度判断する。
-   */
-  const copyImage = async (k: 'frontImage' | 'backImage') => {
-    const s = slots[k];
-    const src = s.processed ?? (s.id ? await (await fetch(`/api/images/${s.id}`, { cache: 'no-store' })).blob() : null);
-    if (!src) { toast('画像がありません'); return; }
-    const img = await decode(src);
-    const c = document.createElement('canvas');
-    c.width = img.width; c.height = img.height;
-    c.getContext('2d')!.drawImage(img, 0, 0);
-    const png = await new Promise<Blob | null>((r) => c.toBlob(r, 'image/png'));
-    c.width = c.height = 0;
-    if (!png) throw new Error('画像の変換に失敗しました');
-    await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
-    toast(`${k === 'frontImage' ? '表面' : '裏面'}の画像をコピーしました。ChatGPT に貼り付けてください`);
-  };
-  const aiRead = () => {
-    const answer = h('textarea', { placeholder: 'ChatGPT の回答をここに貼り付け', 'aria-label': 'ChatGPT の回答' });
-    const err = h('div', {});
-    const safe = (fn: () => Promise<void>) => () => { fn().catch((e) => toast(`コピーできませんでした：${(e as Error).message}`)); };
-    ocrBox.replaceChildren(h('div', { class: 'panel ai-read' },
-      h('h2', { class: 'mt0' }, 'ChatGPT で読み取る'),
-      h('div', { class: 'warn-box small' },
-        '名刺画像（取引先の個人情報）が ChatGPT に送信されます。社内のルールで認められている場合だけ使ってください。',
-        h('br'), 'ChatGPT の設定で「すべての人のためにモデルを改善する」をオフにし、「一時チャット」で読み取ることをおすすめします。'),
-      h('ol', { class: 'steps' },
-        h('li', {}, h('a', { href: 'https://chatgpt.com/?temporary-chat=true', target: '_blank', rel: 'noopener noreferrer' }, 'ChatGPT を開く（一時チャット）')),
-        h('li', {}, h('div', { class: 'row' },
-          h('button', { type: 'button', class: 'btn btn-sm', onclick: safe(async () => { await navigator.clipboard.writeText(AI_PROMPT); toast('指示文をコピーしました。ChatGPT に貼り付けてください'); }) }, '指示文をコピー'),
-          h('button', { type: 'button', class: 'btn btn-sm', onclick: safe(() => copyImage('frontImage')) }, '表面の画像をコピー'),
-          slots.backImage.preview ? h('button', { type: 'button', class: 'btn btn-sm', onclick: safe(() => copyImage('backImage')) }, '裏面の画像をコピー') : null),
-          h('div', { class: 'small muted' }, '指示文と画像を ChatGPT に貼り付けて送信します（画像は1枚ずつコピー＆貼り付け）。')),
-        h('li', {}, 'ChatGPT の回答をコピーして、下に貼り付け', answer)),
-      err,
-      h('div', { class: 'row' },
-        h('button', { type: 'button', class: 'btn btn-primary', onclick: () => {
-          try { showCandidates(parseAiAnswer(answer.value), answer.value); }
-          catch (e) { err.replaceChildren(h('div', { class: 'error-box' }, (e as Error).message)); }
-        } }, '回答を読み込んで候補を表示'),
-        h('button', { type: 'button', class: 'btn', onclick: () => ocrBox.replaceChildren() }, '閉じる'))));
   };
   const showCandidates = (c: OcrCandidates, raw: string) => {
     const rows = (Object.entries(c) as [TextKey, string][]).filter(([, v]) => v).map(([k, v]) => {
