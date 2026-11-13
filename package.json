@@ -1,0 +1,62 @@
+{
+  "name": "meishi-kanri",
+  "version": "1.0.0",
+  "private": true,
+  "description": "名刺管理（社内デスクトップアプリ。データは共有フォルダに保存、外部通信なし）",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "build": "npm run build:main && npm run build:client && node scripts/copy-vendor.mjs",
+    "build:main": "tsc -p tsconfig.server.json",
+    "build:client": "tsc -p tsconfig.client.json",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "test": "npm run build:main && node --test --test-concurrency=1 dist/test/*.test.js",
+    "start": "npm run build && electron .",
+    "dist:win": "npm run build && electron-builder --win",
+    "dev:server": "node dist/server/devserver.js"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@tesseract.js-data/eng": "1.0.0",
+    "@tesseract.js-data/jpn": "1.0.0",
+    "@types/node": "22.20.5",
+    "electron": "33.4.11",
+    "electron-builder": "25.1.8",
+    "tesseract.js": "7.0.0",
+    "tesseract.js-core": "7.0.0",
+    "typescript": "5.9.3"
+  },
+  "productName": "MeishiKanri",
+  "main": "dist/desktop/main.js",
+  "build": {
+    "appId": "local.meishi-kanri",
+    "productName": "MeishiKanri",
+    "publish": null,
+    "electronLanguages": [
+      "ja",
+      "en-US"
+    ],
+    "files": [
+      "dist/server/**/*",
+      "dist/desktop/**/*",
+      "!dist/server/devserver.js",
+      "!dist/server/cli.js",
+      "public/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    },
+    "directories": {
+      "output": "release"
+    }
+  }
+}
