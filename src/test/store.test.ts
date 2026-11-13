@@ -66,11 +66,13 @@ test('複数の PC：同じ版からの同時更新は PC をまたいでも1件
   assert.ok(rs.filter((r) => r.status === 'rejected').every((r) => ['CONFLICT', 'LOCKED'].includes(((r as PromiseRejectedResult).reason as StoreError).code)));
   await pc2.refresh(true);
   assert.equal(pc2.get(c.id)?.version, 2);
-  // 放棄されたロック（PC の停止など）は30秒で無効
+  // 更新が止まっても他PCの処理は自動で奪わない
   const lock = path.join(dataDir, 'locks', `card-${c.id}.lock`);
   await fs.writeFile(lock, '{}');
   const old = new Date(Date.now() - 60_000);
   await fs.utimes(lock, old, old);
+  await assert.rejects(store.update(c.id, 2, f({ name: '引き継ぎ' })), (e: StoreError) => e.code === 'LOCKED');
+  await fs.unlink(lock); // 全PC停止を確認した管理者の解除を模擬
   assert.equal((await store.update(c.id, 2, f({ name: '引き継ぎ' }))).version, 3);
   await pc2.close();
   await store.close();

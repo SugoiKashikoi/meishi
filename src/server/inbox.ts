@@ -43,7 +43,7 @@ export class Inbox {
 
   private serial<T>(fn: () => Promise<T>): Promise<T> { return this.lock(fn); }
 
-  async scan(): Promise<InboxItem[]> {
+  async scan(opts: { splitPdfs?: boolean } = {}): Promise<InboxItem[]> {
     let names: string[];
     try {
       names = await fs.readdir(this.dir);
@@ -51,7 +51,7 @@ export class Inbox {
       this.lastError = '取り込み用フォルダにアクセスできません。';
       throw new StoreError('STORAGE_UNAVAILABLE', `取り込み用フォルダにアクセスできません: ${this.dir}`);
     }
-    if (names.some((n) => n.toLowerCase().endsWith('.pdf'))) {
+    if (opts.splitPdfs !== false && names.some((n) => n.toLowerCase().endsWith('.pdf'))) {
       if (await this.serial(() => this.splitPdfs(names))) names = await fs.readdir(this.dir).catch(() => names);
     }
     const next = new Map<string, InboxItem & { file: string }>();
@@ -102,11 +102,15 @@ export class Inbox {
         const buf = await fs.readFile(file);
         if (!isPdf(buf)) throw new Error('PDF ファイルではありません。');
         const pages = extractJpegsFromPdf(buf);
+        const digest = crypto.createHash('sha256').update(buf).digest('hex');
         const base = path.basename(name, path.extname(name)).replace(/[^\p{L}\p{N}._-]/gu, '_').replace(/^[.~]+/, '').slice(0, 60) || 'scan';
         const old = new Date(now - SETTLE_MS * 2);
         for (let i = 0; i < pages.length; i++) {
-          const out = path.join(this.dir, `${base}-p${String(i + 1).padStart(2, '0')}.jpg`);
-          try { await fs.access(out); continue; } catch { /* 未作成 */ }
+          const out = path.join(this.dir, `${base}-${digest}-p${String(i + 1).padStart(2, '0')}.jpg`);
+          try {
+            if (!(await fs.readFile(out)).equals(pages[i]!)) throw new Error('分割先に異なる画像があります。元のPDFを残して取り込みを中止しました。');
+            continue;
+          } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
           const tmp = path.join(this.dir, `.tmp-${crypto.randomBytes(4).toString('hex')}.jpg`);
           await fs.writeFile(tmp, pages[i]!, { flag: 'wx' });
           await fs.utimes(tmp, old, old);
@@ -117,7 +121,7 @@ export class Inbox {
         changed = true;
       } catch (e) {
         this.pdfErrors.set(key, (e as Error).message);
-        log('warn', 'inbox pdf not usable', { error: (e as Error).message });
+        log('warn', 'inbox pdf not usable', { code: (e as NodeJS.ErrnoException).code ?? 'PDF_ERROR' });
       }
     }
     return changed;
@@ -170,7 +174,7 @@ export class Inbox {
       for (const id of ids) {
         const it = this.items.get(id);
         let ok = !!it;
-        if (it) { try { await fs.access(it.file); } catch { ok = false; } }
+        if (it) { try { const st = await fs.stat(it.file); ok = st.isFile() && st.size === it.size && st.mtime.toISOString() === it.mtime; } catch { ok = false; } }
         if (!ok && strict) throw new InboxGoneError();
         targets.push({ id, it: ok ? it : undefined });
       }

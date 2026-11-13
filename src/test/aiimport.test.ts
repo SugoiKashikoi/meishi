@@ -75,3 +75,43 @@ test('切り抜き・回転：範囲の検証、表裏それぞれに指定、�
   assert.match(none[0]!.error!, /画像処理/);
   await store.close();
 });
+
+test('AI登録：共有フォルダ内PDFは試し実行で移動せず、成功時に元PDFを1回だけ移動する', async () => {
+  const { store, dataDir, root } = await tempStore();
+  const dir = path.join(root, 'inbox'); await fs.mkdir(dir);
+  const file = path.join(dir, 'sample.pdf');
+  await fs.writeFile(file, makePdf([{ data: jpegWithSize(1200, 700) }]));
+  const old = new Date(Date.now() - 60000); await fs.utimes(file, old, old);
+  const inbox = new Inbox(dir, path.join(dataDir, 'inbox-done'), 90, fn => store.withLock('inbox', fn));
+  const form = { company: '架空PDF社', frontImageFile: file };
+  const dry = await aiImport(store, form, { user: 'test', baseDir: root, inbox, dryRun: true });
+  assert.equal(dry[0]!.ok, true);
+  assert.deepEqual(await fs.readdir(dir), ['sample.pdf']);
+  assert.equal(store.list().length, 0);
+  const result = await aiImport(store, form, { user: 'test', baseDir: root, inbox });
+  assert.equal(result[0]!.ok, true);
+  assert.equal(result[0]!.movedFromInbox, 1);
+  assert.deepEqual(await fs.readdir(dir), []);
+  assert.equal((await fs.readdir(path.join(dataDir, 'inbox-done'))).length, 1);
+});
+
+test('AI登録：取り込み用フォルダが不通の場合は登録を中止する', async () => {
+  const { store, dataDir, root } = await tempStore();
+  const inbox = new Inbox(path.join(root, 'missing'), path.join(dataDir, 'inbox-done'), 90);
+  await assert.rejects(aiImport(store, { name: '架空' }, { user: 'test', baseDir: root, inbox }), /取り込み用フォルダにアクセスできません/);
+  assert.equal(store.list().length, 0);
+});
+
+test('AI登録：10秒以内の新着画像を移動対象から外したまま登録しない', async () => {
+  const { store, root, dataDir } = await tempStore();
+  const dir = path.join(root, 'inbox'); await fs.mkdir(dir);
+  const file = path.join(dir, 'new.jpg'); await fs.writeFile(file, jpegWithExif());
+  const inbox = new Inbox(dir, path.join(dataDir, 'inbox-done'), 90, fn => store.withLock('inbox', fn));
+  for (const dryRun of [true, false]) {
+    const r = await aiImport(store, { name: '架空', frontImageFile: file }, { user: 'test', baseDir: root, inbox, dryRun });
+    assert.equal(r[0]!.ok, false);
+    assert.match(r[0]!.error!, /10秒/);
+  }
+  assert.equal(store.list().length, 0);
+  await fs.access(file);
+});

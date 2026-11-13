@@ -10,7 +10,7 @@ import { Store, StoreError } from './store.js';
 import { Inbox, InboxGoneError } from './inbox.js';
 
 export interface User { id: string; name: string }
-import { Card, ID_RE, ValidationError, norm, parseCardFields } from './card.js';
+import { Card, ID_RE, normPhone, ValidationError, norm, parseCardFields } from './card.js';
 import { toCsv } from './csv.js';
 import { log } from './log.js';
 import { extractJpegsFromPdf, PdfError } from './pdf.js';
@@ -63,7 +63,11 @@ async function readBody(req: http.IncomingMessage, limit: number): Promise<Buffe
 }
 async function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   if (!String(req.headers['content-type'] ?? '').startsWith('application/json')) throw new HttpError(415, 'JSON で送信してください。');
-  try { return JSON.parse((await readBody(req, 256 * 1024)).toString('utf8')); } catch (e) {
+  try {
+    const body: unknown = JSON.parse((await readBody(req, 256 * 1024)).toString('utf8'));
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, '入力が不正です。');
+    return body as Record<string, unknown>;
+  } catch (e) {
     if (e instanceof HttpError) throw e;
     throw new HttpError(400, '入力が不正です。');
   }
@@ -137,7 +141,7 @@ export function createHandler({ config, store, user, inbox, displayName = (id) =
     const all = store.list();
     const hits = all.filter((c) =>
       (!cat || c.category === cat) && (!ev || c.event === ev) && (!tag || c.tags.includes(tag)) &&
-      terms.every((t) => store.searchKey(c.id).includes(t)));
+      terms.every((t) => store.searchKey(c.id).includes(t) || (/^[+\d()-]+$/.test(t) && normPhone(t).length >= 3 && [c.phone, c.mobile, c.postalCode].some((v) => normPhone(v).includes(normPhone(t))))));
     const coll = new Intl.Collator('ja');
     if (sort === 'company') hits.sort((a, b) => coll.compare(a.company || '￿', b.company || '￿') || coll.compare(a.kana || a.name, b.kana || b.name));
     else if (sort === 'exchange') hits.sort((a, b) => (b.exchangeDate || '0').localeCompare(a.exchangeDate || '0') || b.createdAt.localeCompare(a.createdAt));
@@ -163,7 +167,7 @@ export function createHandler({ config, store, user, inbox, displayName = (id) =
 
     if (p === '/api/status' && m === 'GET') {
       return json(res, 200, {
-        storage: { available: store.available, error: store.lastError, dataDir: store.dataDir, backupDir: store.backupDir },
+        storage: { unreadableCards: store.unreadableCards, available: store.available, error: store.lastError, dataDir: store.dataDir, backupDir: store.backupDir },
         inbox: inbox ? { enabled: true, dir: inbox.dir, error: inbox.lastError } : { enabled: false },
         ocrAvailable, user,
       });
@@ -287,6 +291,7 @@ export function createHandler({ config, store, user, inbox, displayName = (id) =
       throw new HttpError(404, '見つかりません。');
     }
     if (p === '/api/export.csv' && m === 'GET') {
+      await store.refresh();
       const cards = store.list().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       const name = `meishi-${new Date().toISOString().slice(0, 10)}.csv`;
       return send(res, 200, toCsv(cards), 'text/csv; charset=utf-8', { 'Content-Disposition': `attachment; filename="${name}"` });

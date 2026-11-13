@@ -5,7 +5,7 @@
   "description": "名刺管理（社内デスクトップアプリ。データは共有フォルダに保存、外部通信なし）",
   "type": "module",
   "engines": {
-    "node": ">=20.11"
+    "node": ">=22.12"
   },
   "scripts": {
     "build": "npm run build:main && npm run build:client && node scripts/copy-vendor.mjs",
@@ -22,8 +22,8 @@
     "@tesseract.js-data/eng": "1.0.0",
     "@tesseract.js-data/jpn": "1.0.0",
     "@types/node": "22.20.5",
-    "electron": "33.4.11",
-    "electron-builder": "25.1.8",
+    "electron": "45.3.1",
+    "electron-builder": "26.18.0",
     "tesseract.js": "7.0.0",
     "tesseract.js-core": "7.0.0",
     "typescript": "5.9.3"

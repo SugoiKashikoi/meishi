@@ -7,7 +7,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 const require = createRequire(import.meta.url);
 const { _electron: electron, chromium } = require('playwright');
-const electronPath = require('electron'); // プロジェクトの devDependencies の Electron
+const { Store } = await import('../dist/server/store.js');
+// executablePath指定時はPlaywrightが自動挿入しない起動ローダーを明示する。
+// ready前に接続し、起動直後のページを取り逃がす競合を防ぐ（Playwright 1.65）。
+const electronLoader = path.join(path.dirname(require.resolve('playwright-core/package.json')), 'lib/server/electron/loader.js');
+const electronPath = process.env.MEISHI_E2E_EXECUTABLE || require('electron'); // プロジェクトの devDependencies の Electron
 
 const work = path.resolve(process.argv[2] ?? 'e2e-work');
 fs.rmSync(work, { recursive: true, force: true });
@@ -15,10 +19,13 @@ const share = path.join(work, 'share');
 const dataDir = path.join(share, 'meishi');
 const inboxDir = path.join(share, 'meishi-inbox');
 fs.mkdirSync(inboxDir, { recursive: true });
+// 架空データは明示的に初期化した開発用ストアだけに保存する。
+await Store.init(dataDir, path.join(dataDir, 'backups'), { dev: true });
 const shots = path.join(work, 'shots');
 fs.mkdirSync(shots, { recursive: true });
 const step = (s) => console.log(`- ${s}`);
 const external = [];
+const launched = [];
 
 // 架空の名刺画像（表・裏）と2ページの PDF
 const b = await chromium.launch();
@@ -41,14 +48,16 @@ await g.pdf({ path: pdf, width: '91mm', height: '55mm' });
 await b.close();
 
 async function launch(name) {
-  const app = await electron.launch({ executablePath: electronPath, args: ['.', `--user-data-dir=${path.join(work, `userdata-${name}`)}`, '--no-sandbox'], cwd: process.cwd(), env: { ...process.env, MEISHI_DEV_USER: name === 'pc2' ? 'hanako' : 'taro' } });
-  const win = await app.firstWindow();
+  const app = await electron.launch({ timeout: 30000, executablePath: electronPath, args: ['-r', electronLoader, '.', `--user-data-dir=${path.join(work, `userdata-${name}`)}`, '--no-sandbox'], cwd: process.cwd(), env: { ...process.env, MEISHI_DEV_USER: name === 'pc2' ? 'hanako' : 'taro' } });
+  launched.push(app);
+  const win = await app.firstWindow({ timeout: 30000 });
   win.on('request', (r) => { const u = r.url(); if (!/^(app|blob|data):/.test(u)) external.push(u); });
   win.on('dialog', (d) => d.accept());
-  await win.setViewportSize({ width: 1200, height: 820 }).catch(() => undefined);
+  // BrowserWindow自体を1200x820で起動する。仮想X上のリサイズ応答には依存しない。
   return { app, win };
 }
 
+try {
 // ---- PC1：初回設定 → 保存先を初期化 ----
 let pc1 = await launch('pc1');
 let w = pc1.win;
@@ -58,21 +67,30 @@ await w.fill('#s-inbox', inboxDir);
 await w.fill('#s-name', '見本太郎');
 await w.screenshot({ path: path.join(shots, 'setup.png') });
 await w.click('text=この設定で開始');
-await w.click('text=フォルダを作成して初期化する');
 await w.waitForSelector('text=まだ名刺が登録されていません');
 if (!fs.existsSync(path.join(dataDir, '.meishi-store'))) throw new Error('保存先が初期化されていない');
-step('PC1: 初回設定で共有フォルダを保存先として初期化');
+if (!JSON.parse(fs.readFileSync(path.join(dataDir, '.meishi-store'), 'utf8')).dev) throw new Error('開発用保存先ではない');
+step('PC1: 初回設定で開発用共有フォルダを指定');
 
 // ---- PC1：画像から登録（OCR 候補 → 確認 → 保存） ----
 await w.click('#topnav >> text=＋ 新規登録');
+await w.waitForSelector('#f-company');
+if (await w.locator('#back-image-slot').isVisible()) throw new Error('新規登録では裏面を隠す');
+await w.getByRole('button', { name: '＋ 裏面を追加', exact: true }).click();
+if (!await w.locator('#back-image-slot').isVisible()) throw new Error('裏面を追加できない');
+await w.getByRole('button', { name: '裏面を閉じる', exact: true }).click();
+if (await w.locator('#back-image-slot').isVisible()) throw new Error('空の裏面を閉じられない');
 await w.locator('.slot').first().locator('input[type=file]').setInputFiles(img);
 await w.waitForSelector('text=アップロード完了', { timeout: 30000 });
-if (await w.locator('text=文字を読み取る').count()) {
+if (!await w.locator('text=文字を読み取る').count()) throw new Error('OCR が利用できない');
+{
   const t0 = Date.now();
   await w.click('text=文字を読み取る');
   await w.waitForSelector('text=読み取り結果（入力候補）', { timeout: 120000 });
   const vals = await w.locator('.ocr-cands input[type=text]').evaluateAll((els) => els.map((e) => e.value));
   step(`PC1: OCR ${((Date.now() - t0) / 1000).toFixed(1)}秒 候補 ${JSON.stringify(vals)}`);
+  const phone = await w.locator('.ocr-cands label').filter({ hasText: '電話番号' }).locator('input[type=text]').inputValue();
+  if (phone !== '03-0000-1234') throw new Error('OCR の電話番号候補が一致しない');
   await w.click('text=選択した項目を入力欄に反映');
 }
 await w.fill('#f-company', '架空商事株式会社');
@@ -81,16 +99,32 @@ await w.fill('#f-memo', '展示会で新製品の説明を受けた');
 await w.click('.savebar button[type=submit]');
 await w.waitForSelector('img.thumb');
 const cardHash = await w.evaluate(() => location.hash);
-step('PC1: 名刺を保存（共有フォルダに保存）');
+if (await w.locator('img.thumb').count() !== 1) throw new Error('表面だけで保存できない');
+step('PC1: 表面だけで名刺を保存（共有フォルダに保存）');
 
 // ---- PC1：PDF から表裏を登録 ----
 await w.click('#topnav >> text=＋ 新規登録');
 await w.locator('.slot').first().locator('input[type=file]').setInputFiles(pdf);
 await w.waitForFunction(() => document.querySelectorAll('.st.ok').length === 2, null, { timeout: 30000 });
+await w.locator('.slot').nth(1).getByRole('button', { name: '文字を読み取る' }).click();
+await w.waitForSelector('text=読み取り結果（入力候補）', { timeout: 120000 });
+const backText = await w.locator('.ocr-cands .raw').textContent() ?? '';
+if (!/KAKUU/i.test(backText)) throw new Error('裏面の英文OCRが取得できない');
+await w.getByRole('button', { name: '閉じる', exact: true }).click();
+step('PC1: 裏面もOCRできる');
 await w.fill('#f-company', '架空PDF商会');
 await w.click('.savebar button[type=submit]');
 await w.waitForFunction(() => document.querySelectorAll('img.thumb').length === 2, null, { timeout: 10000 });
 step('PC1: PDF（2ページ）から表裏の画像を取り出して保存');
+await w.getByRole('link', { name: '編集', exact: true }).click();
+await w.waitForSelector('#f-company');
+if (!await w.locator('#back-image-slot img').isVisible()) throw new Error('保存済みの裏面を編集できない');
+if (await w.getByRole('button', { name: '＋ 裏面を追加', exact: true }).isVisible()) throw new Error('保存済みの裏面を空扱いしている');
+await w.locator('#back-image-slot').getByRole('button', { name: '削除', exact: true }).click();
+if (await w.locator('#back-image-slot').isVisible()) throw new Error('裏面を削除した後に表面だけの表示にならない');
+await w.getByRole('link', { name: '← 戻る', exact: true }).click();
+await w.waitForFunction(() => document.querySelectorAll('img.thumb').length === 2);
+step('PC1: 保存済みの裏面は編集でき、未保存の削除は原本に影響しない');
 
 // ---- PC2：同じ共有フォルダを指定 → PC1 の名刺が見える・編集 ----
 const pc2 = await launch('pc2');
@@ -163,3 +197,7 @@ await pc1.app.close();
 if (external.length) { console.log('外部通信あり:', external); process.exit(1); }
 console.log('外部通信: なし');
 console.log('E2E(desktop) OK');
+
+} finally {
+  await Promise.allSettled(launched.map((app) => app.close()));
+}

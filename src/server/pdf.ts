@@ -67,7 +67,7 @@ export function extractJpegsFromPdf(pdf: Buffer, opts: { max?: number; minSide?:
     let data: Buffer = pdf.subarray(start, end);
     try {
       for (const f of filters.slice(0, dct)) {
-        if (f === '/FlateDecode' || f === '/Fl') data = zlib.inflateSync(data);
+        if (f === '/FlateDecode' || f === '/Fl') data = zlib.inflateSync(data, { maxOutputLength: 30 * 1024 * 1024 });
         else throw new Error('unsupported filter');
       }
       const clean = sanitizeJpeg(data);

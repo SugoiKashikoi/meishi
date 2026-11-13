@@ -89,6 +89,7 @@ table.list td a { color: var(--text); text-decoration: none; font-weight: 600; }
 .ok-box { padding: 12px 16px; border: 1px solid var(--ok); background: var(--ok-weak); color: var(--ok); border-radius: var(--radius); margin-bottom: 16px; }
 
 .images { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+.images.single-image { grid-template-columns: minmax(0, 1fr); max-width: 640px; }
 .slot { border: 1px dashed var(--line); border-radius: var(--radius); padding: 8px; background: var(--surface); }
 .slot .ttl { font-size: .85rem; font-weight: 600; margin-bottom: 6px; display: flex; justify-content: space-between; }
 .slot .pv { aspect-ratio: 91 / 55; background: var(--bg); border-radius: 6px; display: flex; align-items: center; justify-content: center; overflow: hidden; color: var(--muted); font-size: .8rem; }
@@ -159,3 +160,5 @@ pre.raw { white-space: pre-wrap; font-size: .8rem; background: var(--bg); paddin
 .row.nowrap { flex-wrap: nowrap; }
 .row.nowrap input { flex: 1; min-width: 0; }
 .slot.drop { border-color: var(--primary); background: var(--primary-weak); }
+
+.mb16 { margin-bottom: 16px; }

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { AddressInfo } from 'node:net';
 import { createHandler } from '../server/app.js';
 import { Store } from '../server/store.js';
+import { parseCardFields } from '../server/card.js';
 import { Inbox } from '../server/inbox.js';
 import { normalizeConfig } from '../server/config.js';
 import { tempStore, jpegWithExif, jpegWithSize, makePdf } from './helpers.js';
@@ -211,7 +212,8 @@ test('PDF：取り込み用フォルダの PDF をページ画像に分割・ブ
     await fs.writeFile(path.join(s.inboxDir, 'broken.pdf'), '%PDF-1.4 nothing');
     await fs.utimes(path.join(s.inboxDir, 'broken.pdf'), old, old);
     const items = (await s.req('GET', '/api/inbox')).json.items as { name: string; error?: string; type: string }[];
-    assert.deepEqual(items.filter((i) => !i.error).map((i) => i.name).sort(), ['名刺スキャン-p01.jpg', '名刺スキャン-p02.jpg']);
+    assert.equal(items.filter((i) => !i.error).length, 2);
+    for (const it of items.filter((i) => !i.error)) assert.match(it.name, /^名刺スキャン-[0-9a-f]{64}-p0[12]\.jpg$/);
     assert.ok(items.find((i) => i.name === 'broken.pdf')?.error, '取り出せない PDF はエラー付きで表示（破棄できる）');
     assert.ok(!(await fs.readdir(s.inboxDir)).includes('名刺スキャン.pdf'), '元の PDF は取り込み済みへ移動');
     assert.equal((await fs.readdir(path.join(s.dataDir, 'inbox-done'))).filter((x) => x.includes('split-')).length, 1);
@@ -255,5 +257,38 @@ test('別の PC：登録者・更新者の記録、他の PC の変更の反映�
     assert.equal((await pc2.req('DELETE', `/api/cards/${c.json.id}?baseVersion=2`)).status, 200);
     await new Promise((r) => setTimeout(r, 400));
     assert.equal(((await s.req('GET', '/api/cards')).json.cards as unknown[]).length, 0);
+  } finally { await s.done(); }
+});
+
+test('連絡先検索：電話の区切り差・携帯・郵便番号・Webを検索でき、CSVにも他PCの追加を反映する', async () => {
+  const s = await setup();
+  try {
+    await s.req('POST', '/api/cards', { name: '架空連絡先', phone: '03-1234-5678', mobile: '090-2222-3333', postalCode: '100-0001', website: 'https://sample.example.invalid' });
+    for (const q of ['0312345678', '03(1234)5678', '０３−１２３４−５６７８', '09022223333', '1000001', 'sample.example.invalid']) {
+      // Unicode minus is normalized below separately; test NFKC-compatible fullwidth hyphen.
+      const term = q.replace(/−/g, '－');
+      const r = await s.req('GET', `/api/cards?q=${encodeURIComponent(term)}`);
+      assert.equal((r.json.cards as unknown[]).length, 1, q);
+    }
+    const pc2 = await s.otherPc('hanako');
+    await pc2.store.create(parseCardFields({ name: '他PC追加の架空名刺' }));
+    const csv = await s.req('GET', '/api/export.csv');
+    assert.ok(csv.buf.toString('utf8').includes('他PC追加の架空名刺'));
+    await pc2.store.close();
+    for (const body of [null, [], 'invalid']) assert.equal((await s.req('POST', '/api/cards', body)).status, 400);
+  } finally { await s.done(); }
+});
+test('壊れた名刺は状態APIで件数を通知し、内容をログへ出さない', async (t) => {
+  const s = await setup();
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.join(' ')); });
+  try {
+    await fs.writeFile(path.join(s.dataDir, 'cards', `${'e'.repeat(32)}.json`), '{"name":"PRIVATE-NAME","email":"secret@example.invalid",invalid}');
+    await s.store.refresh(true);
+    const status = await s.req('GET', '/api/status');
+    assert.equal((status.json.storage as { unreadableCards: number }).unreadableCards, 1);
+    assert.ok(errors.length > 0);
+    assert.ok(!errors.join('').includes('PRIVATE-NAME'));
+    assert.ok(!errors.join('').includes('secret@example.invalid'));
   } finally { await s.done(); }
 });

@@ -1,7 +1,7 @@
 // 端末内 OCR（Tesseract.js）。エンジン・言語データはすべてこのサーバーの /vendor/ocr/ から読み込み、外部へは送信しない。
 export type OcrCandidates = Partial<Record<'company' | 'department' | 'title' | 'name' | 'kana' | 'phone' | 'mobile' | 'email' | 'postalCode' | 'address' | 'website', string>>;
 
-interface TWorker { recognize(img: Blob): Promise<{ data: { text: string } }>; terminate(): Promise<void> }
+interface TWorker { setParameters(params: Record<string, string | number>): Promise<unknown>; recognize(img: Blob): Promise<{ data: { text: string } }>; terminate(): Promise<void> }
 interface TesseractMod { createWorker(lang: string, oem: number, opts: Record<string, unknown>): Promise<TWorker> }
 
 export async function runOcr(img: Blob, onProgress: (p: number) => void): Promise<string> {
@@ -17,6 +17,8 @@ export async function runOcr(img: Blob, onProgress: (p: number) => void): Promis
     logger: (m: { status: string; progress: number }) => { if (m.status === 'recognizing text') onProgress(m.progress); },
   });
   try {
+    // 名刺は段組み・離れた文字領域が多いため、疎なテキストとして読む。
+    await worker.setParameters({ tessedit_pageseg_mode: '11', preserve_interword_spaces: '1' });
     const r = await worker.recognize(img);
     return r.data.text;
   } finally {
@@ -40,20 +42,24 @@ export function parseCardText(text: string): OcrCandidates {
     const url = /(https?:\/\/)?(www\.)[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+(\/\S*)?|https?:\/\/[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+(\/\S*)?/.exec(l.replace(/[A-Za-z0-9._%+-]+@\S+/, ''));
     if (url && !out.website) { out.website = url[0]; take(i); }
     const zip = /〒?\s*(\d{3})\s*[-ー−]\s*(\d{4})/.exec(l);
-    if (zip && !out.postalCode && (/〒/.test(l) || /[都道府県]/.test(l))) {
+    if (zip && !out.postalCode && (/〒/.test(l) || /[都道府県]/.test(l) || /^\d{3}\s*[-ー−]\s*\d{4}$/.test(l))) {
       out.postalCode = `${zip[1]}-${zip[2]}`;
       const rest = l.replace(zip[0], '').trim();
       if (rest && /[都道府県市区町村]/.test(rest)) out.address = rest;
       take(i);
     }
-    const phones = l.match(/\+?\d{1,4}[\s()-]*\d{1,4}[\s()-]*\d{3,4}(?:[\s()-]*\d{3,4})?/g) ?? [];
-    for (const p of phones) {
+    // ラベルは行単位でなく、その直後の番号にだけ適用する（FAX/TELの混在に対応）。
+    const labels = [...l.matchAll(/FAX|ファックス|ファクス|TEL(?:EPHONE)?|電話|携帯|MOBILE|CELL/gi)];
+    const phones = l.matchAll(/\+?\d[\d ()ー−‐–-]{7,}\d/g);
+    for (const m of phones) {
+      const p = m[0].trim().replace(/[ー−‐–]/g, '-');
       const digits = p.replace(/\D/g, '');
       if (digits.length < 10 || digits.length > 13) continue;
-      if (/fax|ファクス|ファックス|F\s*[:.]/i.test(l) && !/tel|電話|携帯|mobile/i.test(l)) continue;
-      const mobile = /^(0[789]0|\+?81[789]0)/.test(digits) || /携帯|mobile|cell/i.test(l);
-      if (mobile && !out.mobile) out.mobile = p.trim();
-      else if (!mobile && !out.phone) out.phone = p.trim();
+      const label = labels.filter((x) => x.index! < m.index!).at(-1)?.[0] ?? '';
+      if (/fax|ファクス|ファックス/i.test(label)) { take(i); continue; }
+      const mobile = /^(?:0[789]0|81[789]0)/.test(digits) || /携帯|mobile|cell/i.test(label);
+      if (mobile && !out.mobile) out.mobile = p;
+      else if (!mobile && !out.phone) out.phone = p;
       take(i);
     }
   });
@@ -72,7 +78,7 @@ export function parseCardText(text: string): OcrCandidates {
   // 氏名：残りの行のうち、漢字・かな 2〜10 文字（空白1つまで）の短い行
   lines.forEach((l, i) => {
     if (used.has(i)) return;
-    if (!out.kana && /^[ぁ-ゖー ]{2,20}$/.test(l)) { out.kana = l; take(i); return; }
+    if (!out.kana && /^[ぁ-ゖァ-ヶー・ ]{2,20}$/.test(l)) { out.kana = l.replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60)); take(i); return; }
     if (!out.name && new RegExp(`^[${CJK}々]{1,5} ?[${CJK}々]{1,5}$`).test(l)) { out.name = l; take(i); }
   });
   return out;

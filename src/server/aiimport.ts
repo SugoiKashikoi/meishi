@@ -70,6 +70,7 @@ export interface AiImportResult {
   error?: string;
   duplicates?: { id: string; company: string; name: string }[];
   movedFromInbox?: number;
+  inboxMoveFailed?: string[];
 }
 
 const CAT_BY_LABEL: Record<string, string> = Object.fromEntries(Object.entries(CATEGORY_LABELS).filter(([k]) => k).map(([k, v]) => [v, k]));
@@ -90,7 +91,8 @@ export async function aiImport(
   const entries = Array.isArray(input) ? input : [input];
   const results: AiImportResult[] = [];
   await store.refresh(true);
-  const inboxItems = opts.inbox ? await opts.inbox.scan().catch(() => []) : [];
+  // AIが選んだPDFの原本は、登録成功時まで分割・移動しない。接続失敗も隠さない。
+  const inboxItems = opts.inbox ? await opts.inbox.scan({ splitPdfs: false }) : [];
   for (let i = 0; i < entries.length; i++) {
     const raw = entries[i];
     try {
@@ -121,6 +123,12 @@ export async function aiImport(
         for (let n = 0; n < imgs.length; n++) await fs.writeFile(path.join(opts.previewDir, `${i + 1}-${n === 0 ? 'front' : 'back'}.jpg`), imgs[n]!);
       }
       const dups = store.duplicates(fields).map((c) => ({ id: c.id, company: c.company, name: c.name }));
+      // 新着・巨大・置換済みの取り込み画像を一覧から除外されたまま登録しない。
+      const samePath = (a: string, b: string) => process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
+      if (opts.inbox && files.some((f) => f && samePath(path.dirname(f), opts.inbox!.dir)
+        && !inboxItems.some((it) => samePath(path.resolve(opts.inbox!.dir, it.name), f)))) {
+        throw new ValidationError('取り込み用の画像が未確定・移動済み・対象外です。保存完了から10秒以上待ち、一覧とファイルを確認して再実行してください。');
+      }
       if (opts.dryRun) { results.push({ index: i, ok: true, label, duplicates: dups }); continue; }
       const ids: string[] = [];
       for (const b of imgs) ids.push(await store.putImage(b));
@@ -128,11 +136,11 @@ export async function aiImport(
       fields.backImage = ids[1] ?? null;
       // 取り込み用フォルダの画像なら、他の PC との二重登録を防いだうえで取り込み済みへ移動
       const inboxIds = opts.inbox
-        ? inboxItems.filter((it) => files.some((f) => f && path.resolve(opts.inbox!.dir, it.name) === f)).map((it) => it.id)
+        ? inboxItems.filter((it) => files.some((f) => f && samePath(path.resolve(opts.inbox!.dir, it.name), f))).map((it) => it.id)
         : [];
       if (inboxIds.length && opts.inbox) {
         const r = await opts.inbox.completeWith(inboxIds, 'registered', () => store.create(fields, opts.user));
-        results.push({ index: i, ok: true, id: r.value.id, label, duplicates: dups, movedFromInbox: r.moved });
+        results.push({ index: i, ok: true, id: r.value.id, label, duplicates: dups, movedFromInbox: r.moved, inboxMoveFailed: r.failed });
       } else {
         const c = await store.create(fields, opts.user);
         results.push({ index: i, ok: true, id: c.id, label, duplicates: dups });

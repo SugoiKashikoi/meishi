@@ -1,7 +1,8 @@
 // OCR エンジンと言語データを node_modules から public/vendor/ocr にコピーする（実行時に外部から取得しないため）
 import fs from 'node:fs';
 import path from 'node:path';
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/(\w:)/, '$1')), '..');
+import { fileURLToPath } from 'node:url';
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const nm = path.join(root, 'node_modules');
 const out = path.join(root, 'public', 'vendor', 'ocr');
 const cp = (from, to) => { fs.mkdirSync(path.dirname(to), { recursive: true }); fs.copyFileSync(from, to); };
@@ -14,6 +15,6 @@ for (const f of fs.readdirSync(path.join(nm, 'tesseract.js-core'))) {
 }
 for (const l of ['jpn', 'eng']) cp(path.join(nm, `@tesseract.js-data/${l}/4.0.0_best_int/${l}.traineddata.gz`), path.join(out, 'lang', `${l}.traineddata.gz`));
 for (const [f, n] of [['tesseract.js/LICENSE.md', 'LICENSE-tesseract.js.txt'], ['tesseract.js-core/LICENSE', 'LICENSE-tesseract.js-core.txt']]) {
-  if (fs.existsSync(path.join(nm, f))) cp(path.join(nm, f), path.join(out, n.replace('.txt', '.txt')));
+  if (fs.existsSync(path.join(nm, f))) cp(path.join(nm, f), path.join(out, n));
 }
 console.log('OCR ファイルをコピーしました:', out);

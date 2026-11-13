@@ -10,7 +10,7 @@ interface Fields extends Record<TextKey, string> { category: string; tags: strin
 interface Card extends Fields { id: string; version: number; createdAt: string; updatedAt: string; createdByName?: string; updatedByName?: string }
 interface Summary { id: string; version: number; company: string; department: string; title: string; name: string; kana: string; exchangeDate: string; event: string; category: string; tags: string[]; createdAt: string; frontImage: string | null }
 interface User { id: string; name: string }
-interface Status { storage: { available: boolean; error: string; dataDir: string; backupDir: string }; inbox: { enabled: boolean; dir?: string; error?: string }; ocrAvailable: boolean; user: User }
+interface Status { storage: { unreadableCards: number; available: boolean; error: string; dataDir: string; backupDir: string }; inbox: { enabled: boolean; dir?: string; error?: string }; ocrAvailable: boolean; user: User }
 interface InboxItem { id: string; name: string; size: number; mtime: string; type: string; claimedBy?: string; error?: string }
 
 const LABELS: Record<string, string> = {
@@ -76,7 +76,7 @@ async function refreshStatus(): Promise<void> {
   if (location.hash === '#/setup') return;
   try {
     status = await api<Status>('GET', '/api/status');
-    setBanner(status.storage.available ? '' : `保存先（共有フォルダ）に接続できません。保存はできません。表示中の内容は最後に読み込んだものです。${status.storage.error ? '（' + status.storage.error + '）' : ''}`);
+    setBanner(status.storage.available ? (status.storage.unreadableCards ? `読み込めない名刺が${status.storage.unreadableCards}件あります。一覧から除外し、画像の自動整理とバックアップを停止しています。管理者に連絡してください。` : '') : `保存先（共有フォルダ）に接続できません。保存はできません。表示中の内容は最後に読み込んだものです。${status.storage.error ? '（' + status.storage.error + '）' : ''}`);
     for (const el of document.querySelectorAll<HTMLElement>('[data-inbox]')) el.hidden = !status.inbox.enabled;
     if (status.inbox.enabled) void api<{ items: InboxItem[] }>('GET', '/api/inbox').then((r) => {
       for (const el of document.querySelectorAll<HTMLElement>('[data-inbox-count]')) { el.textContent = r.items.length ? String(r.items.length) : ''; el.hidden = !r.items.length; }
@@ -275,10 +275,10 @@ async function viewDetail(id: string): Promise<void> {
     h('p', { class: 'muted mt12' }, c.company),
     h('h1', {}, dispName(c), c.kana ? h('span', { class: 'small muted' }, `　${c.kana}`) : null),
     dupBox,
-    (c.frontImage || c.backImage) ? h('div', { class: 'images' },
+    (c.frontImage || c.backImage) ? h('div', { class: `images${c.frontImage && c.backImage ? '' : ' single-image'}` },
       ...([['frontImage', '表'], ['backImage', '裏']] as const).map(([k, l]) => c[k]
         ? h('figure', { class: 'm0' }, h('img', { class: 'thumb', src: `/api/images/${c[k]}`, alt: `名刺画像（${l}）`, onclick: () => viewer(`/api/images/${c[k]}`) }), h('figcaption', { class: 'small muted' }, `${l}（タップで拡大）`))
-        : h('div', {}))) : null,
+        : null)) : null,
     h('div', { class: 'panel' }, h('dl', {},
       ...row('部署', c.department), ...row('役職', c.title),
       ...row('電話番号', tel(c.phone)), ...row('携帯番号', tel(c.mobile)),
@@ -370,20 +370,36 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
     frontImage: { id: card?.frontImage ?? null, source: null, rotation: 0, preview: card?.frontImage ? `/api/images/${card.frontImage}` : null, state: 'idle', msg: '', processed: null },
     backImage: { id: card?.backImage ?? null, source: null, rotation: 0, preview: card?.backImage ? `/api/images/${card.backImage}` : null, state: 'idle', msg: '', processed: null },
   };
-  const slotEls: Record<string, HTMLElement> = {};
+  const slotEls: Record<string, HTMLElement> = {
+    frontImage: h('div', { class: 'slot' }),
+    backImage: h('div', { class: 'slot', id: 'back-image-slot' }),
+  };
+  let backVisible = !!card?.backImage || fromInbox.length > 1;
+  const imageSlots = h('div', { class: 'images' }, slotEls.frontImage, slotEls.backImage);
+  const addBack = h('button', {
+    type: 'button', class: 'btn btn-ghost btn-sm', 'aria-controls': 'back-image-slot',
+    onclick: () => { backVisible = true; renderSlot('backImage'); },
+  }, '＋ 裏面を追加');
+  let ocrBusy = false;
   const inboxNote = h('div', {});
   const renderSlot = (k: 'frontImage' | 'backImage') => {
     const s = slots[k];
     const file = h('input', { type: 'file', accept: 'image/*,application/pdf,.pdf', class: 'visually-hidden', onchange: (e: Event) => pick(k, e) });
     const busy = s.state === 'busy';
+    // PDFの2枚目・未整理の2枚選択・保存済みの裏面は自動的に表示する。
+    if (k === 'backImage' && (s.preview || busy || s.state === 'err')) backVisible = true;
+    slotEls.backImage!.hidden = !backVisible;
+    addBack.hidden = backVisible;
+    imageSlots.classList.toggle('single-image', !backVisible);
     slotEls[k]!.replaceChildren(
-      h('div', { class: 'ttl' }, h('span', {}, k === 'frontImage' ? '表面' : '裏面')),
+      h('div', { class: 'ttl' }, h('span', {}, k === 'frontImage' ? '表面' : '裏面（任意）'),
+        k === 'backImage' && !s.preview ? h('button', { type: 'button', class: 'btn btn-ghost btn-sm', disabled: busy, onclick: () => { backVisible = false; renderSlot('backImage'); } }, '裏面を閉じる') : null),
       h('div', { class: 'pv', title: 'ここに画像・PDFをドラッグ＆ドロップできます' }, s.preview ? h('img', { src: s.preview, alt: `${k === 'frontImage' ? '表' : '裏'}の画像`, onclick: () => s.preview && viewer(s.preview) }) : '画像なし'),
       h('div', { class: 'acts' },
         h('label', { class: 'btn btn-sm' }, '🖼 画像・PDFを選択', file),
         s.preview ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => void rotate(k) }, '↻ 回転') : null,
-        s.preview ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => { if (confirm('この画像を外しますか？（保存するまで確定しません）')) { Object.assign(s, { id: null, source: null, preview: null, state: 'idle', msg: '', processed: null }); dirty = true; renderSlot(k); } } }, '削除') : null,
-        k === 'frontImage' && s.preview && status?.ocrAvailable ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => void ocr() }, '文字を読み取る') : null,
+        s.preview ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => { if (confirm('この画像を外しますか？（保存するまで確定しません）')) { Object.assign(s, { id: null, source: null, preview: null, state: 'idle', msg: '', processed: null }); dirty = true; if (k === 'backImage') backVisible = false; renderSlot(k); } } }, '削除') : null,
+        s.preview && status?.ocrAvailable ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy || ocrBusy, onclick: () => void ocr(k) }, '文字を読み取る') : null,
         s.state === 'err' && s.processed ? h('button', { type: 'button', class: 'btn btn-sm btn-primary', onclick: () => void upload(k) }, '再試行') : null),
       h('div', { class: `st ${s.state}`, hidden: !s.msg }, s.msg));
   };
@@ -448,17 +464,28 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
 
   // OCR
   const ocrBox = h('div', {});
-  const ocr = async () => {
-    const s = slots.frontImage;
-    const blob = s.processed ?? (s.id ? await (await fetch(`/api/images/${s.id}`, { cache: 'no-store' })).blob() : null);
-    if (!blob) return;
+  const ocr = async (k: 'frontImage' | 'backImage') => {
+    if (ocrBusy) return;
+    ocrBusy = true;
+    renderSlot('frontImage'); renderSlot('backImage');
     const prog = h('div', { class: 'panel' }, '文字を読み取り中…（初回は数十秒かかることがあります）');
     ocrBox.replaceChildren(prog);
     try {
+      const s = slots[k];
+      let blob = s.processed;
+      if (!blob && s.id) {
+        const res = await fetch(`/api/images/${s.id}`, { cache: 'no-store' });
+        if (!res.ok) throw new Error('保存済み画像を読み込めません。保存先の接続を確認してください');
+        blob = await res.blob();
+      }
+      if (!blob) throw new Error('読み取る画像を選んでください');
       const text = await runOcr(blob, (p) => { prog.textContent = `文字を読み取り中… ${Math.round(p * 100)}%`; });
       showCandidates(parseCardText(text), text);
     } catch (e) {
       ocrBox.replaceChildren(h('div', { class: 'error-box' }, `読み取りに失敗しました：${(e as Error).message}。手入力で登録できます。`));
+    } finally {
+      ocrBusy = false;
+      renderSlot('frontImage'); renderSlot('backImage');
     }
   };
   const showCandidates = (c: OcrCandidates, raw: string) => {
@@ -542,7 +569,8 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
     h('h1', {}, id ? '名刺を編集' : '名刺を登録'),
     inboxNote,
     errBox,
-    h('div', { class: 'images' }, (slotEls.frontImage = h('div', { class: 'slot' })), (slotEls.backImage = h('div', { class: 'slot' }))),
+    imageSlots,
+    h('div', { class: 'row mb16' }, addBack),
     ocrBox,
     dupBox,
     h('div', { class: 'grid2' }, mk('company'), mk('name'), mk('kana'), mk('department'), mk('title'), mk('exchangeDate'),

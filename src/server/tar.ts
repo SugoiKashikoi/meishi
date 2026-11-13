@@ -37,7 +37,12 @@ export class TarWriter {
     if (pad) await this.write(Buffer.alloc(pad));
   }
   private async write(b: Buffer): Promise<void> {
-    await this.fh.write(b, 0, b.length, this.pos);
+    let offset = 0;
+    while (offset < b.length) {
+      const { bytesWritten } = await this.fh.write(b, offset, b.length - offset, this.pos + offset);
+      if (!bytesWritten) throw new Error('tar の書き込みが進みませんでした。');
+      offset += bytesWritten;
+    }
     this.pos += b.length;
   }
   async finish(): Promise<void> {
@@ -95,8 +100,12 @@ export class TarReader {
   }
   async read(e: TarEntry): Promise<Buffer> {
     const b = Buffer.alloc(e.size);
-    const { bytesRead } = await this.fh.read(b, 0, e.size, e.offset);
-    if (bytesRead !== e.size) throw new Error('tar の読み込みに失敗しました。');
+    let offset = 0;
+    while (offset < e.size) {
+      const { bytesRead } = await this.fh.read(b, offset, e.size - offset, e.offset + offset);
+      if (!bytesRead) throw new Error('tar の読み込みに失敗しました。');
+      offset += bytesRead;
+    }
     return b;
   }
   async close(): Promise<void> {

@@ -109,6 +109,7 @@ export function normCompany(s: string): string {
 export function searchText(c: CardFields): string {
   return norm([
     c.company, c.department, c.title, c.name, c.kana, c.memo, c.tags.join(' '),
-    c.event, c.place, c.email, c.address, CATEGORY_LABELS[c.category] ?? '',
+    c.event, c.place, c.email, c.address, c.phone, c.mobile, c.postalCode, c.website,
+    normPhone(c.phone), normPhone(c.mobile), c.postalCode.replace(/[^0-9]/g, ''), CATEGORY_LABELS[c.category] ?? '',
   ].join('\u0001'));
 }

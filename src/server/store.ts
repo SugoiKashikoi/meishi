@@ -4,7 +4,7 @@
  * - 1 名刺 = 1 JSON ファイル。一時ファイルに書いて fsync → 同じフォルダ内で rename（置き換え）
  *   → 読み戻して内容一致を確認。途中で失敗しても旧ファイルか新ファイルのどちらかが残る。
  * - 書き込みは対象ごとのロックファイル（locks/<名前>.lock、排他作成）で PC 間の排他を取る。
- *   ロックは保持中に10秒ごと更新し、30秒更新が無ければ（PC の停止など）放棄されたとみなす。
+ *   ロックは保持中に10秒ごと更新する。更新が止まっても自動で奪わない（遅延・スリープと終了を区別できない）。
  * - 更新・削除はロックの中でディスク上の最新版を読み、version が違えば競合として拒否する
  *   （古い内容で上書きしない）。
  * - 画像は不変（内容を変えるときは新しい ID）。名刺 JSON より先に書く。
@@ -95,6 +95,7 @@ export class Store {
   readonly dataDir: string;
   readonly backupDir: string;
   private cards = new Map<string, Card>();
+  private invalidCards = new Set<string>();
   private search = new Map<string, string>();
   private stats = new Map<string, string>();
   private lastStamp = '';
@@ -103,6 +104,7 @@ export class Store {
   private refreshing: Promise<void> | null = null;
   available = false;
   lastError = '';
+  get unreadableCards(): number { return this.invalidCards.size; }
 
   constructor(opts: StoreOptions) {
     this.dataDir = opts.dataDir;
@@ -134,12 +136,16 @@ export class Store {
 
   async open(): Promise<void> {
     await this.checkMarker();
-    for (const d of ['cards', 'images', 'trash', 'tmp', 'locks']) await fs.mkdir(this.p(d), { recursive: true });
-    await fs.mkdir(this.backupDir, { recursive: true });
-    await this.recoverRestore();
-    await this.cleanTemp();
-    await this.refresh(true);
-    this.available = true;
+    await this.assertNoMaintenance();
+    // 起動・復元再開も同じロックで保護し、別PCが復元中のディレクトリを作り直さない。
+    await this.withLock('maintenance', async () => {
+      await this.recoverRestore();
+      for (const d of ['cards', 'images', 'trash', 'tmp', 'locks']) await fs.mkdir(this.p(d), { recursive: true });
+      await fs.mkdir(this.backupDir, { recursive: true });
+      await this.cleanTemp();
+      await this.doRefresh(true);
+      this.available = true;
+    });
   }
 
   async close(): Promise<void> { /* 保持しているロックは各処理の終わりに解放済み */ }
@@ -155,14 +161,15 @@ export class Store {
   private lockPath(name: string): string { return this.p('locks', `${name}.lock`); }
 
   private async lockAge(name: string): Promise<number | null> {
-    try { return Date.now() - (await fs.stat(this.lockPath(name))).mtimeMs; } catch { return null; }
+    try { return Date.now() - (await fs.stat(this.lockPath(name))).mtimeMs; } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null; throw e; }
   }
 
   /** ロックを取って fn を実行する。他の PC が保持中なら待ち、待ちきれなければ LOCKED */
   async withLock<T>(name: string, fn: () => Promise<T>, waitMs = LOCK_WAIT_MS): Promise<T> {
     const file = this.lockPath(name);
     const until = Date.now() + waitMs;
-    const body = JSON.stringify({ host: os.hostname(), pid: process.pid, user: os.userInfo().username, at: new Date().toISOString() });
+    const token = crypto.randomUUID();
+    const body = JSON.stringify({ token, host: os.hostname(), pid: process.pid, user: os.userInfo().username, at: new Date().toISOString() });
     for (;;) {
       try {
         const fh = await fs.open(file, 'wx');
@@ -172,26 +179,42 @@ export class Store {
         const code = (e as NodeJS.ErrnoException).code;
         if (code !== 'EEXIST') throw e;
         const age = await this.lockAge(name);
-        if (age !== null && age > LOCK_STALE_MS) { await fs.unlink(file).catch(() => undefined); continue; }
+        if (age !== null && age > LOCK_STALE_MS) throw new StoreError('LOCKED', '更新が止まったロックがあります。全PCのアプリ・登録コマンドを終了し、管理者がロックを確認してください。自動解除はしません。');
         if (Date.now() > until) {
           throw new StoreError('LOCKED', name === 'maintenance' ? '他のPCで復元作業中です。終わってから再度お試しください。' : '他のPCが同じデータを処理中です。少し待ってから再度お試しください。');
         }
         await new Promise((r) => setTimeout(r, 150 + Math.random() * 250));
       }
     }
-    const beat = setInterval(() => { const t = new Date(); void fs.utimes(file, t, t).catch(() => undefined); }, 10_000);
+    const owns = async () => (await fs.readFile(file, 'utf8')) === body;
+    const beat = setInterval(() => { const t = new Date(); void owns().then((ok) => ok ? fs.utimes(file, t, t) : undefined).catch(() => undefined); }, 10_000);
     beat.unref();
     try {
       return await fn();
     } finally {
       clearInterval(beat);
-      await fs.unlink(file).catch(() => undefined);
+      if (await owns().catch(() => false)) await fs.unlink(file).catch(() => undefined);
     }
   }
 
   private async assertNoMaintenance(): Promise<void> {
     const age = await this.lockAge('maintenance');
-    if (age !== null && age <= LOCK_STALE_MS) throw new StoreError('MAINTENANCE', '他のPCで復元作業中のため、保存できません。終わってから再度保存してください。');
+    if (age !== null) throw new StoreError('MAINTENANCE', '他のPCで復元作業中のため、保存できません。終わってから再度保存してください。');
+  }
+
+  /** 復元の入れ替え前に読み取り完了も待てるよう、処理ごとに登録する。 */
+  private async read<T>(fn: () => Promise<T>): Promise<T> {
+    await this.checkMarker();
+    try {
+      return await this.withLock(`read-${newId()}`, async () => {
+        await this.assertNoMaintenance();
+        if (await exists(this.p(RESTORE_MARKER))) throw new StoreError('MAINTENANCE', '復元が中断されています。管理者が復元を再開してください。');
+        return fn();
+      });
+    } catch (e) {
+      if (e instanceof StoreError) throw e;
+      throw new StoreError('STORAGE_UNAVAILABLE', '保存先から読み込めませんでした。接続を確認してください。');
+    }
   }
 
   /** 書き込み処理：ロック → 復元中でないか確認 → 実行 → 変更の目印を更新 */
@@ -200,6 +223,7 @@ export class Store {
       await this.checkMarker();
       return await this.withLock(lock, async () => {
         await this.assertNoMaintenance();
+        if (await exists(this.p(RESTORE_MARKER))) throw new StoreError('MAINTENANCE', '復元が中断されています。管理者が復元を再開してから保存してください。');
         const r = await fn();
         await this.touchChanged();
         return r;
@@ -267,41 +291,54 @@ export class Store {
    * 他の PC の変更を取り込む。.changed が前回と同じなら何もしない。
    * 変わっていれば、ファイルの更新日時・サイズが変わったものだけ読み直す。
    */
-  refresh(force = false): Promise<void> {
-    if (!force && Date.now() - this.lastRefresh < REFRESH_MIN_MS) return Promise.resolve();
-    if (this.refreshing) return this.refreshing;
-    this.refreshing = this.doRefresh(force).finally(() => { this.refreshing = null; });
-    return this.refreshing;
+  async refresh(force = false): Promise<void> {
+    return this.read(async () => {
+      if (!force && Date.now() - this.lastRefresh < REFRESH_MIN_MS) return;
+      while (this.refreshing) {
+        await this.refreshing;
+        if (!force) return;
+      }
+      // 強制再走査は、進行中の通常読み取りに置き換えない。
+      const refresh = this.doRefresh(force);
+      this.refreshing = refresh;
+      try { await refresh; }
+      finally { if (this.refreshing === refresh) this.refreshing = null; }
+    });
   }
 
   private async doRefresh(force: boolean): Promise<void> {
     let stamp = '';
     try { stamp = await fs.readFile(this.p('.changed'), 'utf8'); } catch { stamp = ''; }
     this.lastRefresh = Date.now();
-    if (!force && stamp && stamp === this.lastStamp && Date.now() - this.lastFullScan < FULL_SCAN_MS) return;
-    this.lastFullScan = Date.now();
+    const full = force || Date.now() - this.lastFullScan >= FULL_SCAN_MS;
+    if (!full && stamp && stamp === this.lastStamp) return;
+    if (full) this.lastFullScan = Date.now();
     const names = (await fs.readdir(this.p('cards'))).filter((f) => /^[0-9a-f]{32}\.json$/.test(f));
     const seen = new Set<string>();
+    const diskIds = new Set(names.map((name) => name.slice(0, 32)));
     const queue = [...names];
     const worker = async () => {
       for (let f = queue.shift(); f; f = queue.shift()) {
         const id = f.slice(0, 32);
         seen.add(id);
         let st;
-        try { st = await fs.stat(this.p('cards', f)); } catch { seen.delete(id); continue; }
+        try { st = await fs.stat(this.p('cards', f)); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new StoreError('STORAGE_UNAVAILABLE', '名刺一覧を読み込めませんでした。'); seen.delete(id); continue; }
         const key = `${st.mtimeMs}:${st.size}`;
-        if (this.stats.get(id) === key && this.cards.has(id)) continue;
+        if (!full && this.stats.get(id) === key && this.cards.has(id)) continue;
         try {
           const c = parseStoredCard(JSON.parse(await fs.readFile(this.p('cards', f), 'utf8')));
           if (c.id !== id) throw new Error('id mismatch');
+          this.invalidCards.delete(id);
           this.cards.set(id, c);
           this.search.set(id, searchText(c));
           this.stats.set(id, key);
         } catch (e) {
           const code = (e as NodeJS.ErrnoException).code;
           if (code === 'ENOENT') { seen.delete(id); continue; }
+          if (code) throw new StoreError('STORAGE_UNAVAILABLE', '名刺ファイルを読み込めませんでした。');
+          this.invalidCards.add(id);
           // 壊れたファイルは消さずに残し、一覧から外してログに記録する
-          log('error', 'invalid card file', { file: f, error: (e as Error).message });
+          log('error', 'invalid card file', { file: f, code: code ?? 'INVALID_CARD' });
           seen.delete(id);
         }
       }
@@ -310,6 +347,7 @@ export class Store {
     for (const id of [...this.cards.keys()]) {
       if (!seen.has(id)) { this.cards.delete(id); this.search.delete(id); this.stats.delete(id); }
     }
+    for (const id of this.invalidCards) if (!diskIds.has(id)) this.invalidCards.delete(id);
     this.lastStamp = stamp;
   }
 
@@ -321,19 +359,21 @@ export class Store {
 
   /** ディスクから最新を読む（詳細・編集画面用） */
   async getFresh(id: string): Promise<Card | undefined> {
-    if (!ID_RE.test(id)) return undefined;
-    const file = this.p('cards', `${id}.json`);
-    try {
-      const [buf, st] = await Promise.all([fs.readFile(file, 'utf8'), fs.stat(file)]);
-      const c = parseStoredCard(JSON.parse(buf));
-      this.cards.set(id, c);
-      this.search.set(id, searchText(c));
-      this.stats.set(id, `${st.mtimeMs}:${st.size}`);
-      return c;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') { this.cards.delete(id); this.search.delete(id); return undefined; }
-      throw new StoreError('STORAGE_UNAVAILABLE', '名刺を読み込めませんでした。保存先の接続を確認してください。');
-    }
+    return this.read(async () => {
+      if (!ID_RE.test(id)) return undefined;
+      const file = this.p('cards', `${id}.json`);
+      try {
+        const [buf, st] = await Promise.all([fs.readFile(file, 'utf8'), fs.stat(file)]);
+        const c = parseStoredCard(JSON.parse(buf));
+        this.cards.set(id, c);
+        this.search.set(id, searchText(c));
+        this.stats.set(id, `${st.mtimeMs}:${st.size}`);
+        return c;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') { this.cards.delete(id); this.search.delete(id); return undefined; }
+        throw new StoreError('STORAGE_UNAVAILABLE', '名刺を読み込めませんでした。保存先の接続を確認してください。');
+      }
+    });
   }
 
   private async readDisk(id: string): Promise<Card | undefined> {
@@ -427,13 +467,14 @@ export class Store {
 
   private async referencedImages(): Promise<Set<string>> {
     await this.refresh(true);
+    if (this.invalidCards.size) throw new StoreError('INVALID', '読めない名刺があるため、画像の掃除を中止しました。');
     const refs = new Set<string>();
     for (const c of this.cards.values()) { if (c.frontImage) refs.add(c.frontImage); if (c.backImage) refs.add(c.backImage); }
     for (const f of await fs.readdir(this.p('trash'))) {
       try {
-        const t = JSON.parse(await fs.readFile(this.p('trash', f), 'utf8'));
-        for (const k of ['frontImage', 'backImage']) if (typeof t[k] === 'string') refs.add(t[k]);
-      } catch { /* ignore */ }
+        const t = parseStoredCard(JSON.parse(await fs.readFile(this.p('trash', f), 'utf8')));
+        for (const k of ['frontImage', 'backImage'] as const) if (typeof t[k] === 'string') refs.add(t[k]);
+      } catch { throw new StoreError('STORAGE_UNAVAILABLE', 'ゴミ箱の名刺を読み込めないため、画像の掃除を中止しました。'); }
     }
     return refs;
   }
@@ -479,7 +520,9 @@ export class Store {
   async createBackup(kind: 'auto' | 'manual' | 'pre-restore'): Promise<BackupInfo> {
     try { await this.checkMarker(); } catch (e) { throw e; }
     return this.withLock('jobs', async () => {
-      await this.refresh(true);
+      if (kind === 'pre-restore') await this.doRefresh(true);
+      else { await this.assertNoMaintenance(); await this.refresh(true); }
+      if (this.invalidCards.size) throw new StoreError('INVALID', '読めない名刺があるため、バックアップを中止しました。元ファイルを確認してください。');
       const cards = [...this.cards.values()].map((c) => ({ ...c }));
       const images = new Set<string>();
       for (const c of cards) { if (c.frontImage) images.add(c.frontImage); if (c.backImage) images.add(c.backImage); }
@@ -547,6 +590,7 @@ export class Store {
       if (!me || me.size > 50 * 1024 * 1024) throw new Error('manifest.json がありません。');
       const m = JSON.parse((await r.read(me)).toString('utf8')) as Manifest;
       if (m.format !== BACKUP_FORMAT || m.formatVersion !== 1) throw new Error('このアプリのバックアップではありません。');
+      if (r.entries.filter((e) => e.name === 'manifest.json').length !== 1) throw new Error('manifest.json が重複しています。');
       const names = new Set<string>();
       let cards = 0;
       let imgs = 0;
@@ -587,15 +631,15 @@ export class Store {
   /** 復元用の一時ディレクトリ（共有フォルダ内 tmp） */
   tmpPath(name: string): string { return this.p('tmp', name); }
 
-  /** 他の PC の書き込み（card-/img- ロック）が終わるのを待つ */
+  /** 他の PC の読み書き（card-/img-/read- ロック）が終わるのを待つ */
   private async waitForWriters(): Promise<void> {
     const until = Date.now() + LOCK_STALE_MS + 5_000;
     for (;;) {
       const busy = [];
       for (const f of await fs.readdir(this.p('locks'))) {
-        if (!/^(card|img)-/.test(f)) continue;
+        if (!/^(card|img|read)-/.test(f)) continue;
         const age = await this.lockAge(f.replace(/\.lock$/, ''));
-        if (age !== null && age <= LOCK_STALE_MS) busy.push(f);
+        if (age !== null) busy.push(f);
       }
       if (!busy.length) return;
       if (Date.now() > until) throw new StoreError('LOCKED', '他のPCの保存処理が終わらないため、復元を中止しました。');
@@ -633,7 +677,7 @@ export class Store {
       await this.finishRestore(staging, old);
       await this.touchChanged();
       this.cards.clear(); this.search.clear(); this.stats.clear();
-      await this.refresh(true);
+      await this.doRefresh(true);
       log('info', 'restore completed', { cards: summary.cardCount, images: summary.imageCount });
       return { summary, preRestore };
     });
@@ -657,16 +701,14 @@ export class Store {
   /** 復元が途中で止まっていたら完了させる（復元中の PC がまだ動いている間は触らない） */
   private async recoverRestore(): Promise<void> {
     if (!fss.existsSync(this.p(RESTORE_MARKER))) return;
-    const age = await this.lockAge('maintenance');
-    if (age !== null && age <= LOCK_STALE_MS) return;
-    await this.withLock('maintenance', async () => {
-      if (!fss.existsSync(this.p(RESTORE_MARKER))) return;
-      const { staging, old } = JSON.parse(await fs.readFile(this.p(RESTORE_MARKER), 'utf8'));
-      const okPath = (x: unknown) => typeof x === 'string' && path.dirname(x) === this.dataDir && /restore-(staging|old)-\d{8}-\d{6}$/.test(x);
-      if (!okPath(staging) || !okPath(old)) throw new StoreError('INVALID', '復元マーカーが不正です。管理者が確認してください。');
-      log('warn', 'resuming interrupted restore');
-      await this.finishRestore(staging, old);
-      await this.touchChanged();
-    });
+    // 呼び出し元 open() が maintenance を保持している。
+    await this.waitForWriters();
+    const { staging, old } = JSON.parse(await fs.readFile(this.p(RESTORE_MARKER), 'utf8'));
+    const okPath = (x: unknown, prefix: string) => typeof x === 'string' && path.dirname(x) === this.dataDir
+      && new RegExp(`^${prefix}-\\d{8}-\\d{6}$`).test(path.basename(x));
+    if (!okPath(staging, 'restore-staging') || !okPath(old, 'restore-old')) throw new StoreError('INVALID', '復元マーカーが不正です。管理者が確認してください。');
+    log('warn', 'resuming interrupted restore');
+    await this.finishRestore(staging, old);
+    await this.touchChanged();
   }
 }

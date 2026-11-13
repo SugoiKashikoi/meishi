@@ -32,6 +32,8 @@
 
 ## 開発
 
+Node.js 22.12以上が必要です（このクラウドでは24.22.1で検証）。
+
 ```bash
 npm ci
 ```
@@ -56,3 +58,5 @@ npm run dist:win
 
 - デスクトップ版の通し確認：`xvfb-run -a node scripts/e2e-desktop.mjs <作業フォルダ>`（Playwright が必要。架空の名刺画像・PDF をその場で生成して使います）
 - `src/server/devserver.ts` は開発・自動テスト専用（127.0.0.1 のみ）。配布版には含めません。
+
+- [docs/検証とOCR評価.md](docs/検証とOCR評価.md) — 障害対策、OCR比較、残る検証項目
