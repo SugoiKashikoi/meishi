@@ -1,0 +1,12 @@
+{
+  "dataDir": "\\\\fileserver\\share\\meishi",
+  "backupDir": "\\\\fileserver\\share\\meishi-backup",
+  "host": "0.0.0.0",
+  "port": 8443,
+  "https": {
+    "pfxPath": "C:\\meishi\\certs\\server.pfx",
+    "pfxPassphraseEnv": "MEISHI_PFX_PASSPHRASE"
+  },
+  "autoBackup": { "intervalHours": 24, "keep": 14 },
+  "sessionDays": 30
+}

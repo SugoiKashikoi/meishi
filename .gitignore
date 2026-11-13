@@ -1,0 +1,10 @@
+node_modules/
+dist/
+public/js/
+public/vendor/
+config/config.json
+config/auth.json
+config/sessions.json
+release/
+*.log
+.test-data/
