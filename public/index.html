@@ -20,6 +20,7 @@
   <a href="#/" class="brand">名刺管理</a>
   <nav class="topnav" id="topnav" hidden>
     <a href="#/" class="btn btn-ghost">一覧</a>
+    <a href="#/inbox" class="btn btn-ghost" data-inbox hidden>未整理 <span class="badge" data-inbox-count hidden></span></a>
     <a href="#/new" class="btn btn-primary">＋ 新規登録</a>
     <a href="#/admin" class="btn btn-ghost">管理</a>
   </nav>
@@ -28,6 +29,7 @@
 <nav class="bottombar" id="bottombar" hidden>
   <a href="#/" data-action="search">🔍<span>検索</span></a>
   <a href="#/new" class="primary">＋<span>新規登録</span></a>
+  <a href="#/inbox" data-inbox hidden>📥<span>未整理 <b class="badge" data-inbox-count hidden></b></span></a>
   <a href="#/admin">⚙<span>管理</span></a>
 </nav>
 <div id="toast" class="toast" hidden role="status"></div>

@@ -1,6 +1,8 @@
 {
   "dataDir": "\\\\fileserver\\share\\meishi",
   "backupDir": "\\\\fileserver\\share\\meishi-backup",
+  "inboxDir": "\\\\fileserver\\share\\meishi-inbox",
+  "inboxRetentionDays": 90,
   "host": "0.0.0.0",
   "port": 8443,
   "https": {

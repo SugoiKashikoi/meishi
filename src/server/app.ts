@@ -7,7 +7,8 @@ import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { AppConfig } from './config.js';
 import { Store, StoreError } from './store.js';
-import { Auth } from './auth.js';
+import { Auth, User } from './auth.js';
+import { Inbox } from './inbox.js';
 import { Card, ID_RE, ValidationError, norm, parseCardFields } from './card.js';
 import { toCsv } from './csv.js';
 import { log } from './log.js';
@@ -72,9 +73,9 @@ export function summary(c: Card) {
   };
 }
 
-export interface AppDeps { config: AppConfig; store: Store; auth: Auth; secure: boolean }
+export interface AppDeps { config: AppConfig; store: Store; auth: Auth; secure: boolean; inbox?: Inbox }
 
-export function createHandler({ config, store, auth, secure }: AppDeps): http.RequestListener {
+export function createHandler({ config, store, auth, secure, inbox }: AppDeps): http.RequestListener {
   const COOKIE = secure ? '__Host-meishi_sid' : 'meishi_sid';
   const ocrAvailable = fs.existsSync(path.join(config.publicDir, 'vendor', 'ocr', 'lang', 'jpn.traineddata.gz'));
   const pending = new Map<string, { file: string; at: number }>();
@@ -146,15 +147,19 @@ export function createHandler({ config, store, auth, secure }: AppDeps): http.Re
     const m = req.method ?? 'GET';
     const p = url.pathname;
 
-    if (p === '/api/session' && m === 'GET') return json(res, 200, { authenticated: auth.check(token), configured: auth.configured() });
+    if (p === '/api/session' && m === 'GET') {
+      const u = auth.check(token);
+      return json(res, 200, { authenticated: !!u, user: u, configured: auth.configured() });
+    }
     if (p === '/api/login' && m === 'POST') {
       const body = await readJson(req);
-      const r = auth.login(typeof body.password === 'string' ? body.password : '', req.socket.remoteAddress ?? '');
+      const str = (v: unknown) => (typeof v === 'string' ? v.slice(0, 200) : '');
+      const r = auth.login(str(body.userId), str(body.password), req.socket.remoteAddress ?? '');
       if (!r.ok) {
         log('warn', 'login failed', { locked: r.locked });
         throw new HttpError(r.locked ? 429 : 401, r.locked ? 'ログインの失敗が続いたため、しばらく待ってから再度お試しください。' : 'パスワードが違います。');
       }
-      log('info', 'login ok');
+      log('info', 'login ok', { user: r.user.id });
       res.setHeader('Set-Cookie', `${COOKIE}=${r.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${r.maxAge}${secure ? '; Secure' : ''}`);
       return json(res, 200, { ok: true });
     }
@@ -165,17 +170,31 @@ export function createHandler({ config, store, auth, secure }: AppDeps): http.Re
     }
 
     // ---- ここから下はすべて認証必須 ----
-    if (!auth.check(token)) throw new HttpError(401, 'ログインしてください。');
+    const user: User | null = auth.check(token);
+    if (!user) throw new HttpError(401, 'ログインしてください。');
+    const adminOnly = () => { if (user.role !== 'admin') throw new HttpError(403, 'この操作は管理者のみ実行できます。'); };
 
     if (p === '/api/status' && m === 'GET') {
-      return json(res, 200, { storage: { available: store.available, error: store.lastError, dataDir: store.dataDir, backupDir: store.backupDir }, ocrAvailable, secure });
+      return json(res, 200, {
+        storage: { available: store.available, error: store.lastError, dataDir: store.dataDir, backupDir: store.backupDir },
+        inbox: inbox ? { enabled: true, dir: inbox.dir, error: inbox.lastError } : { enabled: false },
+        ocrAvailable, secure, user,
+      });
     }
     if (p === '/api/cards' && m === 'GET') return json(res, 200, listCards(url.searchParams));
     if (p === '/api/facets' && m === 'GET') return json(res, 200, facets());
     if (p === '/api/cards' && m === 'POST') {
-      const card = await store.create(parseCardFields(await readJson(req)));
-      log('info', 'card created', { id: card.id });
-      return json(res, 201, card);
+      const body = await readJson(req);
+      const fields = parseCardFields(body);
+      const fromInbox = Array.isArray(body.fromInbox) ? body.fromInbox : [];
+      if (fromInbox.length > 2 || fromInbox.some((x) => typeof x !== 'string' || !ID_RE.test(x))) throw new HttpError(400, '取り込み画像の指定が不正です。');
+      if (fromInbox.length && !inbox) throw new HttpError(400, '取り込み用フォルダが設定されていません。');
+      if (inbox && fromInbox.some((x) => !inbox.get(x as string))) throw new HttpError(409, 'この画像は既に他の利用者が取り込んだか、移動・削除されています。「未整理」の一覧を更新してください。');
+      const card = await store.create(fields, user.id);
+      log('info', 'card created', { id: card.id, user: user.id });
+      // 名刺の保存が確定してから元画像を取り込み済みへ移動。移動に失敗しても名刺は保存済みとして返し、警告を付ける
+      const moved = fromInbox.length && inbox ? await inbox.complete(fromInbox as string[], 'registered') : undefined;
+      return json(res, 201, { ...card, inboxResult: moved });
     }
     if (p === '/api/duplicates' && m === 'POST') {
       const body = await readJson(req);
@@ -189,20 +208,20 @@ export function createHandler({ config, store, auth, secure }: AppDeps): http.Re
       if (m === 'GET') {
         const c = store.get(id);
         if (!c) throw new HttpError(404, '名刺が見つかりません。');
-        return json(res, 200, c);
+        return json(res, 200, { ...c, createdByName: c.createdBy ? auth.displayName(c.createdBy) : '', updatedByName: c.updatedBy ? auth.displayName(c.updatedBy) : '' });
       }
       if (m === 'PUT') {
         const body = await readJson(req);
         const base = Number(body.baseVersion);
         if (!Number.isInteger(base)) throw new HttpError(400, 'baseVersion が必要です。');
-        const card = await store.update(id, base, parseCardFields(body));
-        log('info', 'card updated', { id, version: card.version });
+        const card = await store.update(id, base, parseCardFields(body), user.id);
+        log('info', 'card updated', { id, version: card.version, user: user.id });
         return json(res, 200, card);
       }
       if (m === 'DELETE') {
         const base = Number(url.searchParams.get('baseVersion'));
         await store.remove(id, base);
-        log('info', 'card deleted', { id });
+        log('info', 'card deleted', { id, user: user.id });
         return json(res, 200, { ok: true });
       }
     }
@@ -220,6 +239,39 @@ export function createHandler({ config, store, auth, secure }: AppDeps): http.Re
       await pipeline(fs.createReadStream(file), res);
       return;
     }
+    // ---- 取り込み用フォルダ ----
+    if (p.startsWith('/api/inbox')) {
+      if (!inbox) throw new HttpError(404, '取り込み用フォルダが設定されていません。');
+      if (p === '/api/inbox' && m === 'GET') {
+        const items = (await inbox.scan()).map((x) => ({ ...x, claimedBy: x.claimedBy && x.claimedBy !== user.id ? auth.displayName(x.claimedBy) : undefined }));
+        return json(res, 200, { items });
+      }
+      if (p === '/api/inbox/discard' && m === 'POST') {
+        const body = await readJson(req);
+        const ids = Array.isArray(body.ids) ? body.ids.filter((x): x is string => typeof x === 'string' && ID_RE.test(x)).slice(0, 100) : [];
+        if (!ids.length) throw new HttpError(400, '対象を選んでください。');
+        const r = await inbox.complete(ids, 'discarded');
+        log('info', 'inbox discarded', { n: r.moved, user: user.id });
+        return json(res, 200, r);
+      }
+      const im = /^\/api\/inbox\/([0-9a-f]{32})\/(file|claim)$/.exec(p);
+      const it = im ? inbox.get(im[1]!) : undefined;
+      if (im && !it) throw new HttpError(404, 'この画像は既に取り込まれたか、移動・削除されています。一覧を更新してください。');
+      if (im && it && im[2] === 'file' && m === 'GET') {
+        let st: fs.Stats;
+        try { st = await fsp.stat(it.file); } catch { throw new HttpError(404, 'この画像は既に取り込まれたか、移動・削除されています。'); }
+        res.writeHead(200, { 'Content-Type': it.type, 'Content-Length': st.size, 'Cache-Control': 'private, no-store' });
+        await pipeline(fs.createReadStream(it.file), res);
+        return;
+      }
+      if (im && it && im[2] === 'claim' && m === 'POST') {
+        const other = inbox.claim(it.id, user.id);
+        return json(res, 200, { claimedBy: other ? auth.displayName(other) : null });
+      }
+      throw new HttpError(404, '見つかりません。');
+    }
+    // ---- 以下は全件の持ち出し・置き換えにあたるため管理者のみ ----
+    if (/^\/api\/(export\.csv|backups|restore)/.test(p)) adminOnly();
     if (p === '/api/export.csv' && m === 'GET') {
       const cards = store.list().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       const name = `meishi-${new Date().toISOString().slice(0, 10)}.csv`;

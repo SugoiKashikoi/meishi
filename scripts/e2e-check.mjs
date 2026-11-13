@@ -1,12 +1,12 @@
 // ブラウザでの通し確認（開発用）。Playwright が入っている環境で実行:
-//   node scripts/e2e-check.mjs http://127.0.0.1:18080 <パスワード> <スクリーンショット出力先>
+//   node scripts/e2e-check.mjs http://127.0.0.1:18080 <スマホ利用者ID:パスワード> <PC利用者ID:パスワード> <出力先> [取り込み用フォルダ]
 // 架空の名刺画像をその場で生成して使う（実在の名刺は使わない）。
 import { createRequire } from 'node:module';
 const { chromium, devices } = createRequire(import.meta.url)('playwright');
 import fs from 'node:fs';
 import path from 'node:path';
 
-const [base, password, outDir = '.'] = process.argv.slice(2);
+const [base, spCred, pcCred, outDir = '.', inboxDir] = process.argv.slice(2);
 const origin = new URL(base).origin;
 const external = [];
 const browser = await chromium.launch();
@@ -29,8 +29,10 @@ const img = path.join(outDir, 'fake-card.jpg');
 fs.writeFileSync(img, Buffer.from(dataUrl.split(',')[1], 'base64'));
 await gen.close();
 
-async function login(page) {
+async function login(page, cred) {
+  const [uid, password] = cred.split(':');
   await page.goto(base + '/#/login');
+  await page.fill('#uid', uid);
   await page.fill('#pw', password);
   await page.click('button[type=submit]');
   await page.waitForSelector('#q');
@@ -41,7 +43,7 @@ const sp = await browser.newContext({ ...devices['iPhone 13'] });
 watch(sp);
 const m = await sp.newPage();
 m.on('dialog', (d) => d.accept());
-await login(m);
+await login(m, spCred);
 await m.screenshot({ path: path.join(outDir, 'sp-list.png') });
 step('スマホ: ログイン・一覧表示');
 await m.click('.bottombar a.primary');
@@ -80,7 +82,7 @@ const pc = await browser.newContext({ viewport: { width: 1280, height: 800 } });
 watch(pc);
 const p = await pc.newPage();
 p.on('dialog', (d) => d.accept());
-await login(p);
+await login(p, pcCred);
 await p.fill('#q', '新製品');
 await p.waitForSelector('table.list >> text=見本 次郎');
 await p.screenshot({ path: path.join(outDir, 'pc-list.png') });
@@ -103,6 +105,32 @@ step('スマホ: 古い版からの保存は競合として止まる（上書き
 await m.click('text=最新の内容を読み込む（入力は破棄）');
 await m.waitForFunction(() => document.querySelector('#f-memo')?.value === 'PCで追記した内容');
 step('スマホ: PCの変更を確認');
+
+// 取り込み用フォルダ経由の登録（PC）
+if (inboxDir) {
+  const f = path.join(inboxDir, `scan-${Date.now()}.jpg`);
+  fs.copyFileSync(img, f);
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(f, old, old);
+  await p.goto(base + '/#/inbox');
+  await p.waitForSelector('.inbox-item');
+  await p.screenshot({ path: path.join(outDir, 'pc-inbox.png') });
+  await p.click('.inbox-item');
+  await p.click('text=選んだ画像で登録');
+  await p.waitForSelector('text=アップロード完了', { timeout: 30000 });
+  await p.fill('#f-company', '架空物産株式会社');
+  await p.fill('#f-name', '取込 三郎');
+  await p.click('.savebar button[type=submit]');
+  await p.waitForURL(/#\/card\/[0-9a-f]{32}$/);
+  await p.waitForSelector('img.thumb');
+  if (fs.existsSync(f)) throw new Error('取り込み用フォルダに元画像が残っている');
+  step('PC: 取り込み用フォルダの画像から登録 → 元画像は取り込み済みへ移動');
+  // スマホ（別の利用者）から検索して確認
+  await m.goto(base + '/#/');
+  await m.fill('#q', '取込');
+  await m.waitForSelector('.cards >> text=取込 三郎');
+  step('スマホ: 他の利用者が登録した名刺を検索で確認');
+}
 
 // 未ログインでの画像取得
 const anon = await browser.newContext();

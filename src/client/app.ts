@@ -7,9 +7,11 @@ const CAT_LABEL: Record<string, string> = Object.fromEntries(CATS);
 const TEXT = ['company', 'department', 'title', 'name', 'kana', 'phone', 'mobile', 'email', 'postalCode', 'address', 'website', 'exchangeDate', 'place', 'event', 'memo'] as const;
 type TextKey = (typeof TEXT)[number];
 interface Fields extends Record<TextKey, string> { category: string; tags: string[]; frontImage: string | null; backImage: string | null }
-interface Card extends Fields { id: string; version: number; createdAt: string; updatedAt: string }
+interface Card extends Fields { id: string; version: number; createdAt: string; updatedAt: string; createdByName?: string; updatedByName?: string }
 interface Summary { id: string; version: number; company: string; department: string; title: string; name: string; kana: string; exchangeDate: string; event: string; category: string; tags: string[]; createdAt: string; hasImage: boolean }
-interface Status { storage: { available: boolean; error: string; dataDir: string; backupDir: string }; ocrAvailable: boolean; secure: boolean }
+interface User { id: string; name: string; role: 'admin' | 'member' }
+interface Status { storage: { available: boolean; error: string; dataDir: string; backupDir: string }; inbox: { enabled: boolean; dir?: string; error?: string }; ocrAvailable: boolean; secure: boolean; user: User }
+interface InboxItem { id: string; name: string; size: number; mtime: string; type: string; claimedBy?: string }
 
 const LABELS: Record<string, string> = {
   company: '会社名', department: '部署', title: '役職', name: '氏名', kana: 'ふりがな', phone: '電話番号', mobile: '携帯番号', email: 'メールアドレス',
@@ -76,6 +78,10 @@ async function refreshStatus(): Promise<void> {
   try {
     status = await api<Status>('GET', '/api/status');
     setBanner(status.storage.available ? '' : `保存先（共有フォルダ）に接続できません。保存はできません。表示中の内容は最後に読み込んだものです。${status.storage.error ? '（' + status.storage.error + '）' : ''}`);
+    for (const el of document.querySelectorAll<HTMLElement>('[data-inbox]')) el.hidden = !status.inbox.enabled;
+    if (status.inbox.enabled) void api<{ items: InboxItem[] }>('GET', '/api/inbox').then((r) => {
+      for (const el of document.querySelectorAll<HTMLElement>('[data-inbox-count]')) { el.textContent = r.items.length ? String(r.items.length) : ''; el.hidden = !r.items.length; }
+    }).catch(() => undefined);
   } catch { /* api() がバナーを出す */ }
 }
 setInterval(() => void refreshStatus(), 30_000);
@@ -98,7 +104,11 @@ async function route(): Promise<void> {
     let m: RegExpExecArray | null;
     if (hash === '#/login') return viewLogin();
     if (!status) await refreshStatus();
-    if (hash === '#/new') return await viewEdit(null);
+    if (hash === '#/new' || hash.startsWith('#/new?')) {
+      const ids = new URLSearchParams(hash.split('?')[1] ?? '').get('inbox')?.split(',').filter((x) => /^[0-9a-f]{32}$/.test(x)).slice(0, 2) ?? [];
+      return await viewEdit(null, ids);
+    }
+    if (hash === '#/inbox') return await viewInbox();
     if ((m = /^#\/card\/([0-9a-f]{32})\/edit$/.exec(hash))) return await viewEdit(m[1]!);
     if ((m = /^#\/card\/([0-9a-f]{32})$/.exec(hash))) return await viewDetail(m[1]!);
     if (hash === '#/admin') return await viewAdmin();
@@ -119,25 +129,27 @@ document.addEventListener('click', (e) => {
 async function viewLogin(): Promise<void> {
   const s = await api<{ authenticated: boolean; configured: boolean }>('GET', '/api/session').catch(() => null);
   if (s?.authenticated) { location.hash = '#/'; return; }
+  const uid = h('input', { type: 'text', id: 'uid', autocomplete: 'username', autocapitalize: 'off', spellcheck: false, required: true });
   const pw = h('input', { type: 'password', id: 'pw', autocomplete: 'current-password', required: true });
   const err = h('div', { class: 'error-box', hidden: true });
   const btn = h('button', { class: 'btn btn-primary', type: 'submit' }, 'ログイン');
   const form = h('form', { class: 'panel login', onsubmit: async (e: Event) => {
     e.preventDefault(); btn.disabled = true; err.hidden = true;
     try {
-      await api('POST', '/api/login', { password: pw.value });
+      await api('POST', '/api/login', { userId: uid.value, password: pw.value });
       status = null; location.hash = '#/';
     } catch (x) { err.textContent = (x as Error).message; err.hidden = false; }
     finally { btn.disabled = false; }
   } },
   h('h1', {}, 'ログイン'),
-  s && !s.configured ? h('div', { class: 'warn-box' }, 'パスワードが未設定です。サーバーPCで「npm run set-password」を実行してください。') : null,
+  s && !s.configured ? h('div', { class: 'warn-box' }, '利用者が未登録です。サーバーPCで利用者を追加してください（導入手順書を参照）。') : null,
   err,
+  h('label', { class: 'field' }, h('span', {}, 'ログインID'), uid),
   h('label', { class: 'field' }, h('span', {}, 'パスワード'), pw),
   btn,
   h('p', { class: 'small muted' }, 'このアプリは社内ネットワーク専用です。'));
   mount(form);
-  pw.focus();
+  uid.focus();
 }
 
 // ---------------- 一覧・検索 ----------------
@@ -244,7 +256,7 @@ async function viewDetail(id: string): Promise<void> {
       ...row('分類', CAT_LABEL[c.category] ?? ''),
       ...row('タグ', c.tags.length ? h('span', { class: 'row' }, ...c.tags.map((t) => h('span', { class: 'chip' }, t))) : null),
       ...row('メモ', c.memo ? h('div', { class: 'memo' }, c.memo) : null))),
-    h('p', { class: 'small muted' }, `登録 ${new Date(c.createdAt).toLocaleString('ja-JP')} ／ 更新 ${new Date(c.updatedAt).toLocaleString('ja-JP')}`),
+    h('p', { class: 'small muted' }, `登録 ${new Date(c.createdAt).toLocaleString('ja-JP')}${c.createdByName ? `（${c.createdByName}）` : ''} ／ 更新 ${new Date(c.updatedAt).toLocaleString('ja-JP')}${c.updatedByName ? `（${c.updatedByName}）` : ''}`),
     h('button', { class: 'btn btn-danger', onclick: async () => {
       if (!confirm(`「${c.company} ${c.name}」を削除しますか？\n（共有フォルダ内のゴミ箱 trash に移動します）`)) return;
       try { await api('DELETE', `/api/cards/${id}?baseVersion=${c.version}`); toast('削除しました'); location.hash = '#/'; }
@@ -298,7 +310,7 @@ async function processImage(src: Blob, rotation: number): Promise<Blob> {
 interface Slot { id: string | null; source: Blob | null; rotation: number; preview: string | null; state: 'idle' | 'busy' | 'ok' | 'err'; msg: string; processed: Blob | null }
 
 // ---------------- 登録・編集 ----------------
-async function viewEdit(id: string | null): Promise<void> {
+async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<void> {
   mount(h('p', { class: 'loading' }, '読み込み中…'));
   let card: Card | null = id ? await api<Card>('GET', `/api/cards/${id}`) : null;
   const facets = await api<{ events: { name: string }[]; tags: { name: string }[] }>('GET', '/api/facets').catch(() => ({ events: [], tags: [] }));
@@ -326,6 +338,7 @@ async function viewEdit(id: string | null): Promise<void> {
     backImage: { id: card?.backImage ?? null, source: null, rotation: 0, preview: card?.backImage ? `/api/images/${card.backImage}` : null, state: 'idle', msg: '', processed: null },
   };
   const slotEls: Record<string, HTMLElement> = {};
+  const inboxNote = h('div', {});
   const renderSlot = (k: 'frontImage' | 'backImage') => {
     const s = slots[k];
     const cam = h('input', { type: 'file', accept: 'image/*', capture: 'environment', class: 'visually-hidden', onchange: (e: Event) => pick(k, e) });
@@ -445,9 +458,11 @@ async function viewEdit(id: string | null): Promise<void> {
     if (Object.values(slots).some((s) => s.state === 'err')) { setState('failed', '画像のアップロードに失敗しています。「再試行」するか画像を削除してください。'); return; }
     saveBtn.disabled = true; setState('saving', '保存中…');
     try {
-      const saved = card ? await api<Card>('PUT', `/api/cards/${card.id}`, { ...f, baseVersion }) : await api<Card>('POST', '/api/cards', f);
+      const saved = card ? await api<Card & { inboxResult?: { failed: string[] } }>('PUT', `/api/cards/${card.id}`, { ...f, baseVersion })
+        : await api<Card & { inboxResult?: { failed: string[] } }>('POST', '/api/cards', { ...f, fromInbox });
       dirty = false; dirtyGuard = null; card = saved; baseVersion = saved.version;
       setState('saved', '保存しました');
+      if (saved.inboxResult?.failed.length) alert('名刺は保存しましたが、取り込み用フォルダの元画像を「取り込み済み」へ移動できませんでした。「未整理」画面に残っている場合は「破棄」してください。');
       toast('保存しました');
       location.hash = `#/card/${saved.id}`;
     } catch (x) {
@@ -475,6 +490,7 @@ async function viewEdit(id: string | null): Promise<void> {
   const form = h('form', { onsubmit: save, novalidate: true },
     h('div', { class: 'row' }, h('a', { href: id ? `#/card/${id}` : '#/', class: 'btn btn-ghost btn-sm' }, '← 戻る')),
     h('h1', {}, id ? '名刺を編集' : '名刺を登録'),
+    inboxNote,
     errBox,
     h('div', { class: 'images' }, (slotEls.frontImage = h('div', { class: 'slot' })), (slotEls.backImage = h('div', { class: 'slot' }))),
     ocrBox,
@@ -491,7 +507,68 @@ async function viewEdit(id: string | null): Promise<void> {
     h('div', { class: 'savebar' }, stateEl, saveBtn));
   mount(form);
   renderSlot('frontImage'); renderSlot('backImage');
+  // 「未整理」から開いた場合：取り込み用フォルダの画像を読み込んで表・裏に設定（縮小・メタデータ除去してからアップロード）
+  if (fromInbox.length) {
+    inboxNote.replaceChildren(h('div', { class: 'warn-box' }, '取り込み用フォルダの画像から登録します。保存すると元の画像は「取り込み済み」に移動します。'));
+    dirty = true;
+    const keys = ['frontImage', 'backImage'] as const;
+    await Promise.all(fromInbox.map(async (iid, i) => {
+      const k = keys[i]!;
+      try {
+        const c = await api<{ claimedBy: string | null }>('POST', `/api/inbox/${iid}/claim`);
+        if (c.claimedBy) inboxNote.append(h('div', { class: 'warn-box' }, `この画像は ${c.claimedBy} さんが登録作業中の可能性があります。重複に注意してください。`));
+        const r = await fetch(`/api/inbox/${iid}/file`, { cache: 'no-store', credentials: 'same-origin' });
+        if (!r.ok) throw new Error(r.status === 404 ? '既に取り込まれたか、移動・削除されています' : `エラー ${r.status}`);
+        slots[k].source = await r.blob();
+        await prepare(k);
+      } catch (e) {
+        Object.assign(slots[k], { state: 'err', msg: `取り込み画像を読み込めませんでした：${(e as Error).message}`, processed: null });
+        renderSlot(k);
+      }
+    }));
+  }
   if (!status?.storage.available) setState('failed', '保存先（共有フォルダ）に接続できないため、現在は保存できません。');
+}
+
+// ---------------- 未整理（取り込み用フォルダ） ----------------
+async function viewInbox(): Promise<void> {
+  mount(h('p', { class: 'loading' }, '読み込み中…'));
+  const r = await api<{ items: InboxItem[] }>('GET', '/api/inbox');
+  const selected: string[] = [];
+  const regBtn = h('button', { class: 'btn btn-primary', disabled: true, onclick: () => { location.hash = `#/new?inbox=${selected.join(',')}`; } }, '選んだ画像で登録');
+  const discBtn = h('button', { class: 'btn btn-danger', disabled: true, onclick: async () => {
+    if (!confirm(`選んだ ${selected.length} 枚を破棄しますか？\n（名刺としては登録せず、取り込み済みフォルダへ移動します）`)) return;
+    try { await api('POST', '/api/inbox/discard', { ids: selected }); toast('破棄しました'); void viewInbox(); }
+    catch (e) { alert(`破棄できませんでした：${(e as Error).message}`); }
+  } }, '破棄');
+  const hint = h('span', { class: 'small muted' }, '1〜2枚選んでください（1枚目＝表、2枚目＝裏）');
+  const update = () => {
+    regBtn.disabled = selected.length < 1 || selected.length > 2;
+    discBtn.disabled = selected.length < 1;
+    hint.textContent = selected.length ? `${selected.length} 枚選択中${selected.length > 2 ? '（登録は2枚まで）' : ''}` : '1〜2枚選んでください（1枚目＝表、2枚目＝裏）';
+    document.querySelectorAll<HTMLElement>('.inbox-item').forEach((el) => {
+      const i = selected.indexOf(el.dataset.id!);
+      el.classList.toggle('sel', i >= 0);
+      el.querySelector('.ord')!.textContent = i === 0 ? '表' : i === 1 ? '裏' : '';
+    });
+  };
+  mount(h('div', {},
+    h('h1', {}, '未整理の名刺画像'),
+    h('p', { class: 'small muted' }, `取り込み用フォルダ（${status?.inbox.dir ?? ''}）に置かれた画像です。複合機のスキャンやPCからのコピーで追加できます。登録すると元の画像は「取り込み済み」へ移動します。`),
+    r.items.length ? h('div', {},
+      h('div', { class: 'row inbox-bar' }, regBtn, discBtn, hint, h('span', { class: 'spacer' }), h('button', { class: 'btn btn-sm', onclick: () => void viewInbox() }, '一覧を更新')),
+      h('ul', { class: 'inbox' }, ...r.items.map((it) => h('li', {}, h('button', { type: 'button', class: 'inbox-item', 'data-id': it.id, onclick: () => {
+        const i = selected.indexOf(it.id);
+        if (i >= 0) selected.splice(i, 1); else selected.push(it.id);
+        update();
+      } },
+        h('span', { class: 'ord' }),
+        h('img', { src: `/api/inbox/${it.id}/file`, alt: it.name, loading: 'lazy', onerror: (e: Event) => { (e.target as HTMLElement).replaceWith(h('span', { class: 'noimg' }, 'プレビューできない形式です')); } }),
+        h('span', { class: 'nm small' }, it.name),
+        h('span', { class: 'small muted' }, `${new Date(it.mtime).toLocaleString('ja-JP')}${it.claimedBy ? ` ・${it.claimedBy} さんが作業中` : ''}`)))))) 
+    : h('div', { class: 'empty' }, h('div', { class: 'big' }, '📥'), h('p', {}, '未整理の画像はありません。'), h('p', { class: 'small' }, '取り込み用フォルダに名刺画像（JPEG・PNG など）を入れると、ここに表示されます。'),
+      h('button', { class: 'btn', onclick: () => void viewInbox() }, '一覧を更新'))));
+  void refreshStatus();
 }
 
 // ---------------- 管理（バックアップ・復元・CSV） ----------------
@@ -549,24 +626,28 @@ async function viewAdmin(): Promise<void> {
     finally { mkBtn.disabled = false; mkBtn.textContent = '今すぐバックアップを作成'; }
   } }, '今すぐバックアップを作成');
   const st = status?.storage;
+  const isAdmin = status?.user.role === 'admin';
   mount(h('div', {},
     h('h1', {}, '管理'),
+    h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, 'ログイン中'), h('p', {}, `${status?.user.name ?? ''}（${status?.user.id ?? ''}・${isAdmin ? '管理者' : '利用者'}）`),
+      h('button', { class: 'btn', onclick: async () => { await api('POST', '/api/logout').catch(() => undefined); status = null; location.hash = '#/login'; } }, 'ログアウト')),
+    status?.inbox.enabled ? h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, '取り込み用フォルダ'), h('p', { class: 'small' }, status.inbox.dir ?? ''),
+      status.inbox.error ? h('div', { class: 'error-box' }, status.inbox.error) : null) : null,
     h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, '保存先'),
       st ? h('div', { class: st.available ? 'ok-box' : 'error-box' }, st.available ? '共有フォルダに接続しています。' : `接続できません：${st.error}`) : null,
       h('p', { class: 'small' }, `データ：${st?.dataDir ?? '-'}`, h('br'), `バックアップ：${st?.backupDir ?? '-'}`),
       status && !status.secure ? h('p', { class: 'small muted' }, '現在 HTTP で接続しています。社内証明書で HTTPS を構成すると通信が暗号化されます（導入手順書を参照）。') : null),
-    h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, 'バックアップ'),
+    !isAdmin ? h('p', { class: 'small muted' }, 'バックアップ・復元・CSV出力は管理者のみ利用できます。') : null,
+    !isAdmin ? null : h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, 'バックアップ'),
       h('p', { class: 'small muted' }, '自動バックアップは画像を含む全件を世代管理で保存します。バックアップが同じ共有ストレージ（NAS）内にある場合、ストレージ自体の故障には備えられません。定期的に「ダウンロード」して別の社内媒体にも保管してください。'),
       h('div', { class: 'row' }, mkBtn), h('div', { class: 'mt12' }, list)),
-    h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, '復元'),
+    !isAdmin ? null : h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, '復元'),
       h('p', { class: 'small muted' }, '上の一覧から選ぶか、ダウンロードしたバックアップファイル（.tar）をアップロードします。復元前に形式とデータを検証します。'),
       h('label', { class: 'btn' }, 'バックアップファイルを選んで検証', fileIn), restoreBox),
-    h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, 'CSV出力'),
+    !isAdmin ? null : h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, 'CSV出力'),
       h('p', { class: 'small' }, 'Excel で開ける CSV（UTF-8 BOM付き）で全件を出力します。', h('strong', {}, 'CSV には名刺画像は含まれません。'), '画像も含めて保存する場合はバックアップを使ってください。'),
-      h('a', { class: 'btn', href: '/api/export.csv', download: true }, 'CSVをダウンロード')),
-    h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, 'ログアウト'),
-      h('button', { class: 'btn', onclick: async () => { await api('POST', '/api/logout').catch(() => undefined); location.hash = '#/login'; } }, 'ログアウト'))));
-  void loadBackups();
+      h('a', { class: 'btn', href: '/api/export.csv', download: true }, 'CSVをダウンロード'))));
+  if (isAdmin) void loadBackups();
 }
 
 void route();

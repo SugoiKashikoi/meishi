@@ -16,6 +16,11 @@ export interface AppConfig {
   dataDir: string;
   /** バックアップの保存先。既定は dataDir 内の backups */
   backupDir: string;
+  /** 取り込み用フォルダ（各利用者が名刺画像を置く共有フォルダ）。未設定なら機能オフ */
+  inboxDir?: string;
+  /** 取り込み済み画像の移動先。既定は dataDir 内の inbox-done（利用者からは見えない） */
+  inboxDoneDir: string;
+  inboxRetentionDays: number;
   host: string;
   port: number;
   https?: HttpsConfig;
@@ -55,9 +60,13 @@ export function normalizeConfig(raw: Partial<AppConfig>, configDir: string): App
   const backupDir = raw.backupDir ? path.resolve(raw.backupDir) : path.join(dataDir, 'backups');
   const port = Number(raw.port ?? 8443);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('port が不正です。');
+  if (raw.inboxDir && !isAbs(raw.inboxDir)) throw new Error('inboxDir は絶対パスで指定してください。');
   return {
     dataDir,
     backupDir,
+    inboxDir: raw.inboxDir ? path.resolve(raw.inboxDir) : undefined,
+    inboxDoneDir: raw.inboxDoneDir ? path.resolve(raw.inboxDoneDir) : path.join(dataDir, 'inbox-done'),
+    inboxRetentionDays: Math.max(1, Number(raw.inboxRetentionDays ?? 90)),
     host: raw.host ?? '0.0.0.0',
     port,
     https: raw.https,

@@ -22,6 +22,9 @@ export interface Card extends CardFields {
   version: number;
   createdAt: string;
   updatedAt: string;
+  /** 登録・最終更新した利用者ID */
+  createdBy?: string;
+  updatedBy?: string;
 }
 
 export const ID_RE = /^[0-9a-f]{32}$/;
@@ -75,7 +78,15 @@ export function parseStoredCard(input: unknown): Card {
   if (typeof src.id !== 'string' || !ID_RE.test(src.id)) throw new ValidationError('ID が不正です。');
   if (!Number.isInteger(src.version) || (src.version as number) < 1) throw new ValidationError('version が不正です。');
   if (typeof src.createdAt !== 'string' || typeof src.updatedAt !== 'string') throw new ValidationError('日時が不正です。');
-  return { id: src.id, version: src.version as number, createdAt: src.createdAt, updatedAt: src.updatedAt, ...fields };
+  const card: Card = { id: src.id, version: src.version as number, createdAt: src.createdAt, updatedAt: src.updatedAt, ...fields };
+  for (const k of ['createdBy', 'updatedBy'] as const) {
+    const v = src[k];
+    if (v !== undefined) {
+      if (typeof v !== 'string' || v.length > 64) throw new ValidationError('登録者が不正です。');
+      card[k] = v;
+    }
+  }
+  return card;
 }
 
 /** 検索・重複判定用の正規化：全角半角統一、カタカナ→ひらがな、小文字化、空白除去 */

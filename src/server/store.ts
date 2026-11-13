@@ -284,23 +284,23 @@ export class Store {
     }
   }
 
-  create(fields: CardFields): Promise<Card> {
+  create(fields: CardFields, userId?: string): Promise<Card> {
     return this.exclusive(() => this.guardWrite(async () => {
       await this.assertImages(fields);
       const now = new Date().toISOString();
-      const card: Card = { id: newId(), version: 1, createdAt: now, updatedAt: now, ...fields };
+      const card: Card = { id: newId(), version: 1, createdAt: now, updatedAt: now, ...fields, createdBy: userId, updatedBy: userId };
       await this.writeCard(card);
       return card;
     }));
   }
 
-  update(id: string, baseVersion: number, fields: CardFields): Promise<Card> {
+  update(id: string, baseVersion: number, fields: CardFields, userId?: string): Promise<Card> {
     return this.exclusive(() => this.guardWrite(async () => {
       const cur = this.cards.get(id);
       if (!cur) throw new StoreError('NOT_FOUND', '名刺が見つかりません（削除された可能性があります）。');
       if (cur.version !== baseVersion) throw new StoreError('CONFLICT', '他の端末で先に更新されています。', cur);
       await this.assertImages(fields);
-      const card: Card = { ...cur, ...fields, version: cur.version + 1, updatedAt: new Date().toISOString() };
+      const card: Card = { ...cur, ...fields, version: cur.version + 1, updatedAt: new Date().toISOString(), updatedBy: userId ?? cur.updatedBy };
       await this.writeCard(card);
       return card;
     }));

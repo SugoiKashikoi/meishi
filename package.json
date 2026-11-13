@@ -15,9 +15,9 @@
     "test": "npm run build:server && node --test --test-concurrency=1 dist/test/*.test.js",
     "start": "node dist/server/main.js",
     "init-store": "node dist/server/cli.js init-store",
-    "set-password": "node dist/server/cli.js set-password",
     "check-config": "node dist/server/cli.js check",
-    "package": "npm run build && node scripts/package.mjs"
+    "package": "npm run build && node scripts/package.mjs",
+    "user": "node dist/server/cli.js user"
   },
   "license": "UNLICENSED",
   "devDependencies": {

@@ -6,11 +6,12 @@ import { Store } from './store.js';
 import { Auth } from './auth.js';
 import { createHandler } from './app.js';
 import { log } from './log.js';
+import { Inbox } from './inbox.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const auth = new Auth(config.configDir, config.sessionDays);
-  if (!auth.configured()) throw new Error('パスワードが未設定です。先に「npm run set-password」を実行してください。');
+  if (!auth.configured()) throw new Error('利用者が未登録です。先に「node dist/server/cli.js user add <ID> --admin」を実行してください。');
   const store = new Store({ dataDir: config.dataDir, backupDir: config.backupDir });
 
   // 共有フォルダに接続できるまで起動を待つ（PC 起動直後はネットワークが未接続のことがある）。
@@ -23,15 +24,18 @@ async function main(): Promise<void> {
     }
   }
 
+  const inbox = config.inboxDir ? new Inbox(config.inboxDir, config.inboxDoneDir, config.inboxRetentionDays) : undefined;
+  if (inbox) await inbox.scan().catch(() => log('warn', 'inbox folder not accessible'));
+
   let server: http.Server;
   const h = config.https;
   if (h && (h.pfxPath || (h.certPath && h.keyPath))) {
     const opts: https.ServerOptions = h.pfxPath
       ? { pfx: fs.readFileSync(h.pfxPath), passphrase: h.pfxPassphraseEnv ? process.env[h.pfxPassphraseEnv] : undefined }
       : { cert: fs.readFileSync(h.certPath!), key: fs.readFileSync(h.keyPath!) };
-    server = https.createServer(opts, createHandler({ config, store, auth, secure: true }));
+    server = https.createServer(opts, createHandler({ config, store, auth, secure: true, inbox }));
   } else {
-    server = http.createServer(createHandler({ config, store, auth, secure: false }));
+    server = http.createServer(createHandler({ config, store, auth, secure: false, inbox }));
   }
   server.requestTimeout = 30 * 60_000;
   server.listen(config.port, config.host, () => {
@@ -47,6 +51,7 @@ async function main(): Promise<void> {
         await store.pruneBackups(config.autoBackup.keep);
       }
       await store.gcImages();
+      if (inbox) await inbox.purge();
     } catch (e) {
       log('error', 'scheduled job failed', { error: (e as Error).message });
     }
