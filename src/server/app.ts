@@ -12,6 +12,7 @@ import { Inbox } from './inbox.js';
 import { Card, ID_RE, ValidationError, norm, parseCardFields } from './card.js';
 import { toCsv } from './csv.js';
 import { log } from './log.js';
+import { extractJpegsFromPdf, PdfError } from './pdf.js';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
@@ -24,6 +25,17 @@ const CSP = [
   "img-src 'self' blob: data:", "style-src 'self'", "font-src 'self'", "object-src 'none'", "base-uri 'none'",
   "frame-ancestors 'none'", "form-action 'self'",
 ].join('; ');
+
+/** ブラウザから受け付けるファイル形式（Content-Type と先頭バイトの両方で確認） */
+const UPLOAD_TYPES: Record<string, { ext: string; magic: (b: Buffer) => boolean }> = {
+  'application/pdf': { ext: '.pdf', magic: (b) => b.subarray(0, 5).toString('latin1') === '%PDF-' },
+  'image/jpeg': { ext: '.jpg', magic: (b) => b[0] === 0xff && b[1] === 0xd8 },
+  'image/png': { ext: '.png', magic: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  'image/webp': { ext: '.webp', magic: (b) => b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP' },
+  'image/heic': { ext: '.heic', magic: (b) => b.subarray(4, 8).toString('latin1') === 'ftyp' },
+  'image/heif': { ext: '.heif', magic: (b) => b.subarray(4, 8).toString('latin1') === 'ftyp' },
+};
+const MAX_UPLOAD = 30 * 1024 * 1024;
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string, readonly extra?: Record<string, unknown>) { super(message); }
@@ -225,6 +237,17 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
         return json(res, 200, { ok: true });
       }
     }
+    if (p === '/api/pdf/extract' && m === 'POST') {
+      // 登録画面で PDF（メモの「書類をスキャン」等）を選んだとき：中の画像を返すだけで、PDF はどこにも保存しない
+      if (req.headers['content-type'] !== 'application/pdf') throw new HttpError(415, 'PDF を送信してください。');
+      try {
+        const imgs = extractJpegsFromPdf(await readBody(req, MAX_UPLOAD), { max: 10 });
+        return json(res, 200, { images: imgs.map((b) => b.toString('base64')) });
+      } catch (e) {
+        if (e instanceof PdfError) throw new HttpError(400, e.message);
+        throw e;
+      }
+    }
     if (p === '/api/images' && m === 'POST') {
       if (req.headers['content-type'] !== 'image/jpeg') throw new HttpError(415, 'JPEG 画像を送信してください。');
       const id = await store.putImage(await readBody(req, config.maxImageBytes));
@@ -245,6 +268,15 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
       if (p === '/api/inbox' && m === 'GET') {
         const items = (await inbox.scan()).map((x) => ({ ...x, claimedBy: x.claimedBy && x.claimedBy !== user.id ? auth.displayName(x.claimedBy) : undefined }));
         return json(res, 200, { items });
+      }
+      if (p === '/api/inbox/upload' && m === 'POST') {
+        const t = UPLOAD_TYPES[String(req.headers['content-type'] ?? '')];
+        if (!t) throw new HttpError(415, '画像（JPEG・PNG・WebP・HEIC）または PDF を選んでください。');
+        const body = await readBody(req, MAX_UPLOAD);
+        if (!t.magic(body)) throw new HttpError(400, 'ファイルの形式が拡張子・種類と一致しません。');
+        await inbox.addFile(body, t.ext, user.id);
+        log('info', 'inbox upload', { user: user.id, bytes: body.length });
+        return json(res, 201, { ok: true });
       }
       if (p === '/api/inbox/discard' && m === 'POST') {
         const body = await readJson(req);

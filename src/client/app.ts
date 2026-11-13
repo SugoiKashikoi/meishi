@@ -11,7 +11,7 @@ interface Card extends Fields { id: string; version: number; createdAt: string; 
 interface Summary { id: string; version: number; company: string; department: string; title: string; name: string; kana: string; exchangeDate: string; event: string; category: string; tags: string[]; createdAt: string; hasImage: boolean }
 interface User { id: string; name: string; role: 'admin' | 'member' }
 interface Status { storage: { available: boolean; error: string; dataDir: string; backupDir: string }; inbox: { enabled: boolean; dir?: string; error?: string }; ocrAvailable: boolean; secure: boolean; user: User }
-interface InboxItem { id: string; name: string; size: number; mtime: string; type: string; claimedBy?: string }
+interface InboxItem { id: string; name: string; size: number; mtime: string; type: string; claimedBy?: string; error?: string }
 
 const LABELS: Record<string, string> = {
   company: '会社名', department: '部署', title: '役職', name: '氏名', kana: 'ふりがな', phone: '電話番号', mobile: '携帯番号', email: 'メールアドレス',
@@ -342,7 +342,7 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
   const renderSlot = (k: 'frontImage' | 'backImage') => {
     const s = slots[k];
     const cam = h('input', { type: 'file', accept: 'image/*', capture: 'environment', class: 'visually-hidden', onchange: (e: Event) => pick(k, e) });
-    const file = h('input', { type: 'file', accept: 'image/*', class: 'visually-hidden', onchange: (e: Event) => pick(k, e) });
+    const file = h('input', { type: 'file', accept: 'image/*,application/pdf,.pdf', class: 'visually-hidden', onchange: (e: Event) => pick(k, e) });
     const busy = s.state === 'busy';
     slotEls[k]!.replaceChildren(
       h('div', { class: 'ttl' }, h('span', {}, k === 'frontImage' ? '表面' : '裏面')),
@@ -359,11 +359,27 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
   const pick = (k: 'frontImage' | 'backImage', e: Event) => {
     const f = (e.target as HTMLInputElement).files?.[0];
     if (!f) return;
+    if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) { void pickPdf(k, f); return; }
     if (!f.type.startsWith('image/') && !/\.(jpe?g|png|heic|heif|webp)$/i.test(f.name)) { alert('画像ファイルを選択してください。'); return; }
     if (f.size > 40 * 1024 * 1024) { alert('画像が大きすぎます（40MBまで）。'); return; }
     Object.assign(slots[k], { source: f, rotation: 0 });
     dirty = true;
     void prepare(k);
+  };
+  /** PDF（メモの「書類をスキャン」等）：サーバーで中の画像を取り出し、1ページ目＝この面、2ページ目＝裏面 */
+  const pickPdf = async (k: 'frontImage' | 'backImage', f: File) => {
+    if (f.size > 30 * 1024 * 1024) { alert('PDF が大きすぎます（30MBまで）。'); return; }
+    Object.assign(slots[k], { state: 'busy', msg: 'PDF から画像を取り出し中…' }); renderSlot(k);
+    try {
+      const r = await api<{ images: string[] }>('POST', '/api/pdf/extract', undefined, new Blob([f], { type: 'application/pdf' }));
+      const blobs = r.images.map((b64) => new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], { type: 'image/jpeg' }));
+      const targets: ('frontImage' | 'backImage')[] = k === 'frontImage' && !slots.backImage.preview && blobs.length > 1 ? ['frontImage', 'backImage'] : [k];
+      dirty = true;
+      await Promise.all(targets.map((t, i) => { Object.assign(slots[t], { source: blobs[i]!, rotation: 0 }); return prepare(t); }));
+      if (blobs.length > targets.length) alert(`この PDF には ${blobs.length} ページあります。最初の${targets.length === 2 ? '2' : '1'}ページを使いました。\n複数の名刺をまとめてスキャンした場合は「未整理」画面の「ファイルを追加」から取り込むと、1枚ずつ登録できます。`);
+    } catch (x) {
+      Object.assign(slots[k], { state: slots[k].id ? 'idle' : 'err', msg: `PDF を読み込めませんでした：${(x as Error).message}`, processed: null }); renderSlot(k);
+    }
   };
   const rotate = async (k: 'frontImage' | 'backImage') => {
     const s = slots[k];
@@ -542,8 +558,29 @@ async function viewInbox(): Promise<void> {
     catch (e) { alert(`破棄できませんでした：${(e as Error).message}`); }
   } }, '破棄');
   const hint = h('span', { class: 'small muted' }, '1〜2枚選んでください（1枚目＝表、2枚目＝裏）');
+  const byId = new Map(r.items.map((x) => [x.id, x]));
+  const upMsg = h('div', {});
+  const upIn = h('input', { type: 'file', multiple: true, accept: 'image/*,application/pdf,.pdf', class: 'visually-hidden', onchange: async (e: Event) => {
+    const files = [...((e.target as HTMLInputElement).files ?? [])];
+    if (!files.length) return;
+    const fails: string[] = [];
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i]!;
+      upMsg.replaceChildren(h('div', { class: 'panel' }, `送信中… ${i + 1} / ${files.length}`));
+      const type = f.type || (/\.pdf$/i.test(f.name) ? 'application/pdf' : /\.heic$/i.test(f.name) ? 'image/heic' : '');
+      try {
+        if (f.size > 30 * 1024 * 1024) throw new Error('30MBを超えています');
+        await api('POST', '/api/inbox/upload', undefined, new Blob([f], { type }));
+      } catch (x) { fails.push(`${f.name}：${(x as Error).message}`); }
+    }
+    await viewInbox();
+    if (fails.length) alert(`送信できなかったファイルがあります（もう一度お試しください）\n${fails.join('\n')}`);
+    else toast(`${files.length} 件を追加しました`);
+  } });
+  const addBtn = h('label', { class: 'btn' }, '＋ ファイルを追加（画像・PDF）', upIn);
   const update = () => {
-    regBtn.disabled = selected.length < 1 || selected.length > 2;
+    const hasErr = selected.some((x) => byId.get(x)?.error);
+    regBtn.disabled = selected.length < 1 || selected.length > 2 || hasErr;
     discBtn.disabled = selected.length < 1;
     hint.textContent = selected.length ? `${selected.length} 枚選択中${selected.length > 2 ? '（登録は2枚まで）' : ''}` : '1〜2枚選んでください（1枚目＝表、2枚目＝裏）';
     document.querySelectorAll<HTMLElement>('.inbox-item').forEach((el) => {
@@ -554,7 +591,8 @@ async function viewInbox(): Promise<void> {
   };
   mount(h('div', {},
     h('h1', {}, '未整理の名刺画像'),
-    h('p', { class: 'small muted' }, `取り込み用フォルダ（${status?.inbox.dir ?? ''}）に置かれた画像です。複合機のスキャンやPCからのコピーで追加できます。登録すると元の画像は「取り込み済み」へ移動します。`),
+    h('p', { class: 'small muted' }, `取り込み用フォルダ（${status?.inbox.dir ?? ''}）に置かれた画像です。複合機のスキャン、PCからのコピー、下の「ファイルを追加」（スマホのメモでスキャンした PDF など）で追加できます。PDF はページごとの画像に分けて表示します。登録すると元の画像は「取り込み済み」へ移動します。`),
+    h('div', { class: 'row' }, addBtn), upMsg,
     r.items.length ? h('div', {},
       h('div', { class: 'row inbox-bar' }, regBtn, discBtn, hint, h('span', { class: 'spacer' }), h('button', { class: 'btn btn-sm', onclick: () => void viewInbox() }, '一覧を更新')),
       h('ul', { class: 'inbox' }, ...r.items.map((it) => h('li', {}, h('button', { type: 'button', class: 'inbox-item', 'data-id': it.id, onclick: () => {
@@ -565,8 +603,9 @@ async function viewInbox(): Promise<void> {
         h('span', { class: 'ord' }),
         h('img', { src: `/api/inbox/${it.id}/file`, alt: it.name, loading: 'lazy', onerror: (e: Event) => { (e.target as HTMLElement).replaceWith(h('span', { class: 'noimg' }, 'プレビューできない形式です')); } }),
         h('span', { class: 'nm small' }, it.name),
-        h('span', { class: 'small muted' }, `${new Date(it.mtime).toLocaleString('ja-JP')}${it.claimedBy ? ` ・${it.claimedBy} さんが作業中` : ''}`)))))) 
-    : h('div', { class: 'empty' }, h('div', { class: 'big' }, '📥'), h('p', {}, '未整理の画像はありません。'), h('p', { class: 'small' }, '取り込み用フォルダに名刺画像（JPEG・PNG など）を入れると、ここに表示されます。'),
+        h('span', { class: 'small muted' }, `${new Date(it.mtime).toLocaleString('ja-JP')}${it.claimedBy ? ` ・${it.claimedBy} さんが作業中` : ''}`),
+        it.error ? h('span', { class: 'st err' }, `${it.error}（破棄してください）`) : null))))) 
+    : h('div', { class: 'empty' }, h('div', { class: 'big' }, '📥'), h('p', {}, '未整理の画像はありません。'), h('p', { class: 'small' }, '取り込み用フォルダに名刺画像（JPEG・PNG・PDF）を入れるか、「ファイルを追加」で送ると、ここに表示されます。'),
       h('button', { class: 'btn', onclick: () => void viewInbox() }, '一覧を更新'))));
   void refreshStatus();
 }

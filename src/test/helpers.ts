@@ -22,3 +22,39 @@ export async function tempStore(): Promise<{ root: string; store: Store; dataDir
   return { root, store, dataDir, backupDir };
 }
 
+
+/** SOF の幅・高さだけを書き換えた JPEG（構造検証用。デコードはしない） */
+export function jpegWithSize(w: number, h: number): Buffer {
+  const b = Buffer.from(TINY_JPEG);
+  const i = b.indexOf(Buffer.from([0xff, 0xc2]));
+  b.writeUInt16BE(h, i + 5);
+  b.writeUInt16BE(w, i + 7);
+  return b;
+}
+
+/** 画像を埋め込んだ最小限の PDF を作る（1ページ1画像） */
+export function makePdf(images: { data: Buffer; indirectLength?: boolean; flate?: boolean; w?: number; h?: number }[]): Buffer {
+  const parts: Buffer[] = [Buffer.from('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n', 'latin1')];
+  let n = 3;
+  const kids: string[] = [];
+  const objs: Buffer[] = [];
+  for (const im of images) {
+    const page = n++, img = n++, len = n++;
+    kids.push(`${page} 0 R`);
+    let data = im.data;
+    if (im.flate) data = zlibDeflate(data);
+    const filter = im.flate ? '[/FlateDecode /DCTDecode]' : '/DCTDecode';
+    const lenRef = im.indirectLength ? `${len} 0 R` : String(data.length);
+    objs.push(Buffer.from(`${page} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources << /XObject << /Im${img} ${img} 0 R >> >> >>\nendobj\n`, 'latin1'));
+    objs.push(Buffer.concat([
+      Buffer.from(`${img} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${im.w ?? 400} /Height ${im.h ?? 300} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter ${filter} /DecodeParms << /K 0 >> /Length ${lenRef} >>\nstream\n`, 'latin1'),
+      data, Buffer.from('\nendstream\nendobj\n', 'latin1'),
+    ]));
+    objs.push(Buffer.from(`${len} 0 obj\n${data.length}\nendobj\n`, 'latin1'));
+  }
+  parts.push(Buffer.from(`1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [${kids.join(' ')}] /Count ${kids.length} >>\nendobj\n`, 'latin1'));
+  parts.push(...objs, Buffer.from('trailer\n<< /Root 1 0 R >>\n%%EOF\n', 'latin1'));
+  return Buffer.concat(parts);
+}
+import zlib from 'node:zlib';
+const zlibDeflate = (b: Buffer) => zlib.deflateSync(b);

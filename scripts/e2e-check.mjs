@@ -27,6 +27,16 @@ const dataUrl = await gen.evaluate(() => {
 });
 const img = path.join(outDir, 'fake-card.jpg');
 fs.writeFileSync(img, Buffer.from(dataUrl.split(',')[1], 'base64'));
+// 架空の名刺を2ページの PDF にする（スキャン PDF の代わり。JPEG がそのまま埋め込まれる）
+const backUrl = await gen.evaluate(() => {
+  const c = document.createElement('canvas'); c.width = 1820; c.height = 1100;
+  const g = c.getContext('2d'); g.fillStyle = '#eef'; g.fillRect(0, 0, c.width, c.height); g.fillStyle = '#000';
+  g.font = '64px sans-serif'; g.fillText('KAKUU SHOJI Co., Ltd. (裏面)', 120, 500);
+  return c.toDataURL('image/jpeg', 0.92);
+});
+await gen.setContent(`<style>@page{size:91mm 55mm;margin:0}body{margin:0}img{width:91mm;height:55mm;display:block;page-break-after:always}</style><img src="${dataUrl}"><img src="${backUrl}">`);
+const pdfFile = path.join(outDir, 'fake-scan.pdf');
+await gen.pdf({ path: pdfFile, width: '91mm', height: '55mm', printBackground: true });
 await gen.close();
 
 async function login(page, cred) {
@@ -130,6 +140,28 @@ if (inboxDir) {
   await m.fill('#q', '取込');
   await m.waitForSelector('.cards >> text=取込 三郎');
   step('スマホ: 他の利用者が登録した名刺を検索で確認');
+}
+
+// スマホ: 登録画面で PDF を選択（1ページ目＝表、2ページ目＝裏）
+await m.goto(base + '/#/new');
+await m.waitForSelector('#f-company');
+await m.locator('.slot').first().locator('input[type=file]:not([capture])').setInputFiles(pdfFile);
+await m.waitForFunction(() => document.querySelectorAll('.st.ok').length === 2, null, { timeout: 30000 });
+step('スマホ: 登録画面で PDF を選ぶと表・裏の2枚を取り出してアップロード');
+await m.fill('#f-company', '架空PDF商会');
+await m.click('.savebar button[type=submit]');
+await m.waitForURL(/#\/card\/[0-9a-f]{32}$/);
+await m.waitForFunction(() => document.querySelectorAll('img.thumb').length === 2, null, { timeout: 10000 });
+step('スマホ: PDF から取り出した表裏画像で保存');
+// スマホ: 未整理に PDF を追加 → ページごとに表示
+if (inboxDir) {
+  await m.goto(base + '/#/inbox');
+  await m.waitForSelector('text=ファイルを追加');
+  const before = await m.locator('.inbox-item').count();
+  await m.locator('input[type=file][multiple]').setInputFiles(pdfFile);
+  await m.waitForFunction((n) => document.querySelectorAll('.inbox-item').length === n + 2, before, { timeout: 30000 });
+  await m.screenshot({ path: path.join(outDir, 'sp-inbox.png') });
+  step('スマホ: 未整理に PDF を追加 → 2ページが2枚の画像として表示');
 }
 
 // 未ログインでの画像取得

@@ -8,7 +8,7 @@ import { createHandler } from '../server/app.js';
 import { Auth, addUser, removeUser, setPassword } from '../server/auth.js';
 import { Inbox } from '../server/inbox.js';
 import { normalizeConfig } from '../server/config.js';
-import { tempStore, jpegWithExif } from './helpers.js';
+import { tempStore, jpegWithExif, jpegWithSize, makePdf } from './helpers.js';
 
 const PW = 'test-password-1234';
 const PW2 = 'member-password-5678';
@@ -276,5 +276,39 @@ test('取り込み用フォルダ：一覧→画像取得→名刺登録で取�
     await fs.rename(s.inboxDir, `${s.inboxDir}-off`);
     assert.equal((await s.req('GET', '/api/inbox')).status, 503);
     await fs.rename(`${s.inboxDir}-off`, s.inboxDir);
+  } finally { await s.done(); }
+});
+
+test('PDF：取り込み用フォルダの PDF をページ画像に分割・ブラウザからの追加・登録画面での取り出し', async () => {
+  const s = await setup();
+  try {
+    await s.req('POST', '/api/login', MEMBER);
+    // 取り込み用フォルダに置かれた2ページの PDF（メモの書類スキャン相当）
+    const pdf = makePdf([{ data: jpegWithSize(1200, 700) }, { data: jpegWithSize(1200, 700) }]);
+    const f = path.join(s.inboxDir, '名刺スキャン.pdf');
+    await fs.writeFile(f, pdf);
+    const old = new Date(Date.now() - 60_000);
+    await fs.utimes(f, old, old);
+    await fs.writeFile(path.join(s.inboxDir, 'broken.pdf'), '%PDF-1.4 nothing');
+    await fs.utimes(path.join(s.inboxDir, 'broken.pdf'), old, old);
+    const items = (await s.req('GET', '/api/inbox')).json.items as { name: string; error?: string; type: string }[];
+    assert.deepEqual(items.filter((i) => !i.error).map((i) => i.name).sort(), ['名刺スキャン-p01.jpg', '名刺スキャン-p02.jpg']);
+    assert.ok(items.find((i) => i.name === 'broken.pdf')?.error, '取り出せない PDF はエラー付きで表示（破棄できる）');
+    assert.ok(!(await fs.readdir(s.inboxDir)).includes('名刺スキャン.pdf'), '元の PDF は取り込み済みへ移動');
+    assert.equal((await fs.readdir(path.join(s.dataDir, 'inbox-done'))).filter((x) => x.includes('split-')).length, 1);
+    // 再スキャンしても重複しない
+    assert.equal(((await s.req('GET', '/api/inbox')).json.items as unknown[]).length, 3);
+    // ブラウザからの追加（スマホのファイル選択）
+    const up = await s.req('POST', '/api/inbox/upload', undefined, { raw: makePdf([{ data: jpegWithSize(900, 600) }]), type: 'application/pdf' });
+    assert.equal(up.status, 201);
+    assert.equal(((await s.req('GET', '/api/inbox')).json.items as unknown[]).length, 4);
+    assert.equal((await s.req('POST', '/api/inbox/upload', undefined, { raw: Buffer.from('<html>'), type: 'application/pdf' })).status, 400, '中身が PDF でない');
+    assert.equal((await s.req('POST', '/api/inbox/upload', undefined, { raw: Buffer.from('x'), type: 'text/html' })).status, 415);
+    assert.equal((await s.req('POST', '/api/inbox/upload', undefined, { raw: pdf, type: 'application/pdf', noCookie: true })).status, 401);
+    // 登録画面での PDF 取り出し（保存はしない）
+    const ex = await s.req('POST', '/api/pdf/extract', undefined, { raw: pdf, type: 'application/pdf' });
+    assert.equal(ex.status, 200);
+    assert.equal((ex.json.images as string[]).length, 2);
+    assert.equal((await s.req('POST', '/api/pdf/extract', undefined, { raw: Buffer.from('%PDF-1.4'), type: 'application/pdf' })).status, 400);
   } finally { await s.done(); }
 });
