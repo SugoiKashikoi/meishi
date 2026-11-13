@@ -8,9 +8,9 @@ const TEXT = ['company', 'department', 'title', 'name', 'kana', 'phone', 'mobile
 type TextKey = (typeof TEXT)[number];
 interface Fields extends Record<TextKey, string> { category: string; tags: string[]; frontImage: string | null; backImage: string | null }
 interface Card extends Fields { id: string; version: number; createdAt: string; updatedAt: string; createdByName?: string; updatedByName?: string }
-interface Summary { id: string; version: number; company: string; department: string; title: string; name: string; kana: string; exchangeDate: string; event: string; category: string; tags: string[]; createdAt: string; hasImage: boolean }
-interface User { id: string; name: string; role: 'admin' | 'member' }
-interface Status { storage: { available: boolean; error: string; dataDir: string; backupDir: string }; inbox: { enabled: boolean; dir?: string; error?: string }; ocrAvailable: boolean; secure: boolean; user: User }
+interface Summary { id: string; version: number; company: string; department: string; title: string; name: string; kana: string; exchangeDate: string; event: string; category: string; tags: string[]; createdAt: string; frontImage: string | null }
+interface User { id: string; name: string }
+interface Status { storage: { available: boolean; error: string; dataDir: string; backupDir: string }; inbox: { enabled: boolean; dir?: string; error?: string }; ocrAvailable: boolean; user: User }
 interface InboxItem { id: string; name: string; size: number; mtime: string; type: string; claimedBy?: string; error?: string }
 
 const LABELS: Record<string, string> = {
@@ -58,11 +58,10 @@ async function api<T>(method: string, path: string, body?: unknown, raw?: Blob):
       body: raw ?? (body !== undefined ? JSON.stringify(body) : undefined),
     });
   } catch {
-    setBanner('サーバーに接続できません。社内ネットワーク（Wi-Fi / VPN）への接続と、サーバーPCが起動しているかを確認してください。');
-    throw new ApiError(0, 'サーバーに接続できません。通信状態を確認してください。');
+    throw new ApiError(0, 'アプリ内部の処理に失敗しました。アプリを再起動してください。');
   }
   const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-  if (res.status === 401 && !path.startsWith('/api/login')) { location.hash = '#/login'; throw new ApiError(401, 'ログインしてください。'); }
+  if (res.status === 503 && data.code === 'SETUP_REQUIRED' && location.hash !== '#/setup') { location.hash = '#/setup'; throw new ApiError(503, String(data.error ?? '保存先を設定してください。'), data); }
   if (!res.ok) throw new ApiError(res.status, String(data.error ?? `エラー (${res.status})`), data);
   return data as T;
 }
@@ -74,7 +73,7 @@ function setBanner(msg: string, warn = false): void {
   b.textContent = msg; b.hidden = !msg; b.classList.toggle('warn', warn);
 }
 async function refreshStatus(): Promise<void> {
-  if (location.hash === '#/login') return;
+  if (location.hash === '#/setup') return;
   try {
     status = await api<Status>('GET', '/api/status');
     setBanner(status.storage.available ? '' : `保存先（共有フォルダ）に接続できません。保存はできません。表示中の内容は最後に読み込んだものです。${status.storage.error ? '（' + status.storage.error + '）' : ''}`);
@@ -97,12 +96,17 @@ async function route(): Promise<void> {
   dirtyGuard = null;
   lastHash = location.hash;
   const hash = location.hash || '#/';
-  const authed = hash !== '#/login';
-  document.getElementById('topnav')!.hidden = !authed;
-  document.getElementById('bottombar')!.hidden = !authed;
+  const ready = hash !== '#/setup';
+  document.getElementById('topnav')!.hidden = !ready;
+  document.getElementById('bottombar')!.hidden = !ready;
   try {
     let m: RegExpExecArray | null;
-    if (hash === '#/login') return viewLogin();
+    if (hash === '#/setup') return await viewSetup();
+    if (!setupChecked) {
+      setupChecked = true;
+      const st = await api<{ ready: boolean }>('GET', '/api/setup');
+      if (!st.ready) { location.hash = '#/setup'; return; }
+    }
     if (!status) await refreshStatus();
     if (hash === '#/new' || hash.startsWith('#/new?')) {
       const ids = new URLSearchParams(hash.split('?')[1] ?? '').get('inbox')?.split(',').filter((x) => /^[0-9a-f]{32}$/.test(x)).slice(0, 2) ?? [];
@@ -114,7 +118,7 @@ async function route(): Promise<void> {
     if (hash === '#/admin') return await viewAdmin();
     return await viewList();
   } catch (e) {
-    if (e instanceof ApiError && e.status === 401) return;
+    if (e instanceof ApiError && e.body.code === 'SETUP_REQUIRED') return;
     mount(h('div', { class: 'error-box' }, h('strong', {}, '読み込めませんでした'), h('p', {}, (e as Error).message),
       h('button', { class: 'btn', onclick: () => void route() }, '再試行')));
   }
@@ -125,35 +129,54 @@ document.addEventListener('click', (e) => {
   if (a) setTimeout(() => (document.getElementById('q') as HTMLInputElement | null)?.focus(), 50);
 });
 
-// ---------------- ログイン ----------------
-async function viewLogin(): Promise<void> {
-  const s = await api<{ authenticated: boolean; configured: boolean }>('GET', '/api/session').catch(() => null);
-  if (s?.authenticated) { location.hash = '#/'; return; }
-  const uid = h('input', { type: 'text', id: 'uid', autocomplete: 'username', autocapitalize: 'off', spellcheck: false, required: true });
-  const pw = h('input', { type: 'password', id: 'pw', autocomplete: 'current-password', required: true });
-  const err = h('div', { class: 'error-box', hidden: true });
-  const btn = h('button', { class: 'btn btn-primary', type: 'submit' }, 'ログイン');
-  const form = h('form', { class: 'panel login', onsubmit: async (e: Event) => {
-    e.preventDefault(); btn.disabled = true; err.hidden = true;
+// ---------------- 初回設定（保存先の指定） ----------------
+let setupChecked = false;
+interface SetupState { ready: boolean; error: string; userId: string; displayName: string; dataDir: string; inboxDir: string }
+async function viewSetup(): Promise<void> {
+  const st = await api<SetupState>('GET', '/api/setup');
+  const dataDir = h('input', { type: 'text', id: 's-data', value: st.dataDir, placeholder: '\\\\fileserver\\share\\meishi' });
+  const inboxDir = h('input', { type: 'text', id: 's-inbox', value: st.inboxDir, placeholder: '（任意）\\\\fileserver\\share\\meishi-inbox' });
+  const name = h('input', { type: 'text', id: 's-name', value: st.displayName, maxlength: 40 });
+  const msg = h('div', {});
+  const choose = (input: HTMLInputElement) => h('button', { type: 'button', class: 'btn', onclick: async () => {
+    const r = await api<{ path: string }>('POST', '/api/setup/choose-folder', {});
+    if (r.path) input.value = r.path;
+  } }, '参照…');
+  const save = async (initialize = false): Promise<void> => {
+    msg.replaceChildren(h('p', { class: 'muted' }, '確認中…'));
     try {
-      await api('POST', '/api/login', { userId: uid.value, password: pw.value });
-      status = null; location.hash = '#/';
-    } catch (x) { err.textContent = (x as Error).message; err.hidden = false; }
-    finally { btn.disabled = false; }
-  } },
-  h('h1', {}, 'ログイン'),
-  s && !s.configured ? h('div', { class: 'warn-box' }, '利用者が未登録です。サーバーPCで利用者を追加してください（導入手順書を参照）。') : null,
-  err,
-  h('label', { class: 'field' }, h('span', {}, 'ログインID'), uid),
-  h('label', { class: 'field' }, h('span', {}, 'パスワード'), pw),
-  btn,
-  h('p', { class: 'small muted' }, 'このアプリは社内ネットワーク専用です。'));
-  mount(form);
-  uid.focus();
+      await api('POST', '/api/setup/save', { dataDir: dataDir.value, inboxDir: inboxDir.value, displayName: name.value, initialize });
+      status = null; toast('保存先に接続しました'); location.hash = '#/';
+    } catch (e) {
+      const err = e as ApiError;
+      if (err.body.error === 'NOT_INITIALIZED') {
+        const b = err.body as { reachable: boolean; empty: boolean; parentOk: boolean };
+        if (!b.reachable && !b.parentOk) { msg.replaceChildren(h('div', { class: 'error-box' }, 'このフォルダ（または親フォルダ）にアクセスできません。パスと共有フォルダの権限を確認してください。')); return; }
+        msg.replaceChildren(h('div', { class: 'warn-box' },
+          h('p', {}, b.reachable ? 'このフォルダはまだ名刺データの保存先になっていません。' : 'このフォルダはまだありません。'),
+          h('p', {}, '最初の1人だけが行う操作です。他の人がすでに使っている場合は、その人と同じフォルダを指定してください。'),
+          h('button', { class: 'btn btn-primary', onclick: () => void save(true) }, b.reachable ? 'このフォルダを保存先として初期化する' : 'フォルダを作成して初期化する')));
+        return;
+      }
+      msg.replaceChildren(h('div', { class: 'error-box' }, err.message));
+    }
+  };
+  mount(h('div', { class: 'panel setup' },
+    h('h1', {}, '保存先の設定'),
+    st.error ? h('div', { class: 'error-box' }, st.error, h('div', { class: 'mt8' }, h('button', { class: 'btn', onclick: async () => {
+      const r = await api<{ ready: boolean }>('POST', '/api/setup/retry', {});
+      if (r.ready) { status = null; location.hash = '#/'; } else void viewSetup();
+    } }, '再接続'))) : null,
+    h('p', { class: 'small muted' }, '名刺データは社内の共有フォルダに保存し、同じフォルダを指定した全員で共有します。このPCには保存しません。'),
+    h('label', { class: 'field' }, h('span', {}, '保存先フォルダ（必須・全員共通）'), h('div', { class: 'row nowrap' }, dataDir, choose(dataDir))),
+    h('label', { class: 'field' }, h('span', {}, '取り込み用フォルダ（任意：複合機のスキャン等を置くフォルダ）'), h('div', { class: 'row nowrap' }, inboxDir, choose(inboxDir))),
+    h('label', { class: 'field' }, h('span', {}, `あなたの表示名（登録者として表示。Windowsユーザー：${st.userId}）`), name),
+    h('div', { class: 'row' }, h('button', { class: 'btn btn-primary', onclick: () => void save(false) }, 'この設定で開始')),
+    msg));
 }
 
 // ---------------- 一覧・検索 ----------------
-const listState = { q: '', category: '', event: '', tag: '', sort: 'created' };
+const listState = { q: '', category: '', event: '', tag: '', sort: 'exchange' };
 async function viewList(): Promise<void> {
   const q = h('input', { type: 'search', id: 'q', placeholder: '会社名・氏名・部署・メモ・タグで検索', value: listState.q, enterkeyhint: 'search', 'aria-label': '検索' });
   const sel = (key: 'category' | 'event' | 'tag' | 'sort', first: string, opts: [string, string][]) =>
@@ -186,7 +209,7 @@ async function viewList(): Promise<void> {
       sel('category', '分類：すべて', CATS),
       sel('event', 'イベント：すべて', f.events.map((x) => [x.name, `${x.name}（${x.count}）`])),
       sel('tag', 'タグ：すべて', f.tags.map((x) => [x.name, `${x.name}（${x.count}）`])),
-      sel('sort', '並べ替え', [['created', '登録が新しい順'], ['exchange', '名刺交換日が新しい順'], ['company', '会社名順']]),
+      sel('sort', '並べ替え', [['exchange', '名刺交換日が新しい順'], ['created', '登録が新しい順'], ['company', '会社名順']]),
     );
   } catch { /* 一覧側でエラー表示 */ }
 }
@@ -200,19 +223,29 @@ function renderList(r: { total: number; cards: Summary[] }): Node[] {
     return [h('div', { class: 'empty' }, h('p', {}, '条件に一致する名刺はありません。'), h('p', { class: 'small' }, '検索語や絞り込みを変えてお試しください。'))];
   }
   const role = (c: Summary) => [c.department, c.title].filter(Boolean).join(' ');
+  // 名刺交換日（または登録日）の月ごとにまとめる。会社名順のときは頭文字ごと
+  const groupKey = (c: Summary): string => {
+    if (listState.sort === 'company') return (c.company || '（会社名なし）').normalize('NFKC').slice(0, 1).toUpperCase();
+    const d = listState.sort === 'created' ? c.createdAt.slice(0, 10) : c.exchangeDate;
+    return d ? `${d.slice(0, 4)}年${Number(d.slice(5, 7))}月` : '交換日なし';
+  };
+  const groups: [string, Summary[]][] = [];
+  for (const c of r.cards) {
+    const k = groupKey(c);
+    const last = groups[groups.length - 1];
+    if (last && last[0] === k) last[1].push(c); else groups.push([k, [c]]);
+  }
+  const item = (c: Summary) => h('li', {}, h('a', { href: `#/card/${c.id}`, class: 'card-row' },
+    h('span', { class: 'thumb-s' }, c.frontImage ? h('img', { src: `/api/images/${c.frontImage}`, alt: '', loading: 'lazy' }) : h('span', { class: 'noimg' }, '画像なし')),
+    h('span', { class: 'info' },
+      h('span', { class: 'nm' }, c.name || c.company, c.name && c.kana ? h('span', { class: 'kana' }, c.kana) : null),
+      c.name ? h('span', { class: 'co' }, c.company || '（会社名なし）') : null,
+      role(c) ? h('span', { class: 'role' }, role(c)) : null,
+      h('span', { class: 'meta' }, c.exchangeDate ? h('span', {}, fmtDate(c.exchangeDate)) : null, c.event ? h('span', {}, c.event) : null,
+        c.category ? h('span', { class: 'chip' }, CAT_LABEL[c.category] ?? '') : null))));
   return [
     h('p', { class: 'count' }, `${r.cards.length} 件${r.cards.length !== r.total ? `（全 ${r.total} 件中）` : ''}`),
-    h('ul', { class: 'cards only-sp' }, ...r.cards.map((c) => h('li', {}, h('a', { href: `#/card/${c.id}` },
-      h('div', { class: 'co' }, c.company || '（会社名なし）'),
-      h('div', { class: 'nm' }, dispName(c)),
-      h('div', { class: 'meta' }, role(c) ? h('span', {}, role(c)) : null, c.exchangeDate ? h('span', {}, `交換日 ${fmtDate(c.exchangeDate)}`) : null,
-        c.category ? h('span', { class: 'chip' }, CAT_LABEL[c.category] ?? '') : null))))),
-    h('table', { class: 'list only-pc' },
-      h('thead', {}, h('tr', {}, ...['会社名', '氏名', '部署・役職', '交換日', 'イベント', '分類'].map((x) => h('th', { scope: 'col' }, x)))),
-      h('tbody', {}, ...r.cards.map((c) => h('tr', { onclick: () => { location.hash = `#/card/${c.id}`; } },
-        h('td', {}, c.company), h('td', {}, h('a', { href: `#/card/${c.id}` }, dispName(c)), c.kana ? h('div', { class: 'small muted' }, c.kana) : null),
-        h('td', {}, role(c)), h('td', {}, fmtDate(c.exchangeDate)), h('td', {}, c.event),
-        h('td', {}, c.category ? h('span', { class: 'chip' }, CAT_LABEL[c.category] ?? '') : ''))))),
+    ...groups.map(([k, cs]) => h('section', { class: 'group' }, h('h2', { class: 'group-h' }, k, h('span', { class: 'muted small' }, ` ${cs.length}件`)), h('ul', { class: 'cardlist' }, ...cs.map(item)))),
   ];
 }
 
@@ -341,15 +374,13 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
   const inboxNote = h('div', {});
   const renderSlot = (k: 'frontImage' | 'backImage') => {
     const s = slots[k];
-    const cam = h('input', { type: 'file', accept: 'image/*', capture: 'environment', class: 'visually-hidden', onchange: (e: Event) => pick(k, e) });
     const file = h('input', { type: 'file', accept: 'image/*,application/pdf,.pdf', class: 'visually-hidden', onchange: (e: Event) => pick(k, e) });
     const busy = s.state === 'busy';
     slotEls[k]!.replaceChildren(
       h('div', { class: 'ttl' }, h('span', {}, k === 'frontImage' ? '表面' : '裏面')),
-      h('div', { class: 'pv' }, s.preview ? h('img', { src: s.preview, alt: `${k === 'frontImage' ? '表' : '裏'}の画像`, onclick: () => s.preview && viewer(s.preview) }) : '画像なし'),
+      h('div', { class: 'pv', title: 'ここに画像・PDFをドラッグ＆ドロップできます' }, s.preview ? h('img', { src: s.preview, alt: `${k === 'frontImage' ? '表' : '裏'}の画像`, onclick: () => s.preview && viewer(s.preview) }) : '画像なし'),
       h('div', { class: 'acts' },
-        h('label', { class: 'btn btn-sm' }, '📷 撮影', cam),
-        h('label', { class: 'btn btn-sm' }, '🖼 選択', file),
+        h('label', { class: 'btn btn-sm' }, '🖼 画像・PDFを選択', file),
         s.preview ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => void rotate(k) }, '↻ 回転') : null,
         s.preview ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => { if (confirm('この画像を外しますか？（保存するまで確定しません）')) { Object.assign(s, { id: null, source: null, preview: null, state: 'idle', msg: '', processed: null }); dirty = true; renderSlot(k); } } }, '削除') : null,
         k === 'frontImage' && s.preview && status?.ocrAvailable ? h('button', { type: 'button', class: 'btn btn-sm', disabled: busy, onclick: () => void ocr() }, '文字を読み取る') : null,
@@ -358,7 +389,9 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
   };
   const pick = (k: 'frontImage' | 'backImage', e: Event) => {
     const f = (e.target as HTMLInputElement).files?.[0];
-    if (!f) return;
+    if (f) pickFile(k, f);
+  };
+  const pickFile = (k: 'frontImage' | 'backImage', f: File) => {
     if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) { void pickPdf(k, f); return; }
     if (!f.type.startsWith('image/') && !/\.(jpe?g|png|heic|heif|webp)$/i.test(f.name)) { alert('画像ファイルを選択してください。'); return; }
     if (f.size > 40 * 1024 * 1024) { alert('画像が大きすぎます（40MBまで）。'); return; }
@@ -478,6 +511,7 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
         : await api<Card & { inboxResult?: { failed: string[] } }>('POST', '/api/cards', { ...f, fromInbox });
       dirty = false; dirtyGuard = null; card = saved; baseVersion = saved.version;
       setState('saved', '保存しました');
+      void refreshStatus();
       if (saved.inboxResult?.failed.length) alert('名刺は保存しましたが、取り込み用フォルダの元画像を「取り込み済み」へ移動できませんでした。「未整理」画面に残っている場合は「破棄」してください。');
       toast('保存しました');
       location.hash = `#/card/${saved.id}`;
@@ -523,6 +557,16 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
     h('div', { class: 'savebar' }, stateEl, saveBtn));
   mount(form);
   renderSlot('frontImage'); renderSlot('backImage');
+  for (const k of ['frontImage', 'backImage'] as const) {
+    const el = slotEls[k]!;
+    el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('drop'); });
+    el.addEventListener('dragleave', () => el.classList.remove('drop'));
+    el.addEventListener('drop', (e) => {
+      e.preventDefault(); el.classList.remove('drop');
+      const f = e.dataTransfer?.files?.[0];
+      if (f) pickFile(k, f);
+    });
+  }
   // 「未整理」から開いた場合：取り込み用フォルダの画像を読み込んで表・裏に設定（縮小・メタデータ除去してからアップロード）
   if (fromInbox.length) {
     inboxNote.replaceChildren(h('div', { class: 'warn-box' }, '取り込み用フォルダの画像から登録します。保存すると元の画像は「取り込み済み」に移動します。'));
@@ -531,8 +575,6 @@ async function viewEdit(id: string | null, fromInbox: string[] = []): Promise<vo
     await Promise.all(fromInbox.map(async (iid, i) => {
       const k = keys[i]!;
       try {
-        const c = await api<{ claimedBy: string | null }>('POST', `/api/inbox/${iid}/claim`);
-        if (c.claimedBy) inboxNote.append(h('div', { class: 'warn-box' }, `この画像は ${c.claimedBy} さんが登録作業中の可能性があります。重複に注意してください。`));
         const r = await fetch(`/api/inbox/${iid}/file`, { cache: 'no-store', credentials: 'same-origin' });
         if (!r.ok) throw new Error(r.status === 404 ? '既に取り込まれたか、移動・削除されています' : `エラー ${r.status}`);
         slots[k].source = await r.blob();
@@ -603,7 +645,7 @@ async function viewInbox(): Promise<void> {
         h('span', { class: 'ord' }),
         h('img', { src: `/api/inbox/${it.id}/file`, alt: it.name, loading: 'lazy', onerror: (e: Event) => { (e.target as HTMLElement).replaceWith(h('span', { class: 'noimg' }, 'プレビューできない形式です')); } }),
         h('span', { class: 'nm small' }, it.name),
-        h('span', { class: 'small muted' }, `${new Date(it.mtime).toLocaleString('ja-JP')}${it.claimedBy ? ` ・${it.claimedBy} さんが作業中` : ''}`),
+        h('span', { class: 'small muted' }, `${new Date(it.mtime).toLocaleString('ja-JP')}`),
         it.error ? h('span', { class: 'st err' }, `${it.error}（破棄してください）`) : null))))) 
     : h('div', { class: 'empty' }, h('div', { class: 'big' }, '📥'), h('p', {}, '未整理の画像はありません。'), h('p', { class: 'small' }, '取り込み用フォルダに名刺画像（JPEG・PNG・PDF）を入れるか、「ファイルを追加」で送ると、ここに表示されます。'),
       h('button', { class: 'btn', onclick: () => void viewInbox() }, '一覧を更新'))));
@@ -665,18 +707,17 @@ async function viewAdmin(): Promise<void> {
     finally { mkBtn.disabled = false; mkBtn.textContent = '今すぐバックアップを作成'; }
   } }, '今すぐバックアップを作成');
   const st = status?.storage;
-  const isAdmin = status?.user.role === 'admin';
+  const isAdmin = true; // 権限は共有フォルダのアクセス権で管理（アクセスできる人は全機能を使える）
   mount(h('div', {},
     h('h1', {}, '管理'),
-    h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, 'ログイン中'), h('p', {}, `${status?.user.name ?? ''}（${status?.user.id ?? ''}・${isAdmin ? '管理者' : '利用者'}）`),
-      h('button', { class: 'btn', onclick: async () => { await api('POST', '/api/logout').catch(() => undefined); status = null; location.hash = '#/login'; } }, 'ログアウト')),
+    h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, '利用者・保存先の設定'), h('p', {}, `${status?.user.name ?? ''}（Windowsユーザー：${status?.user.id ?? ''}）`),
+      h('a', { class: 'btn', href: '#/setup' }, '設定を変更')),
     status?.inbox.enabled ? h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, '取り込み用フォルダ'), h('p', { class: 'small' }, status.inbox.dir ?? ''),
       status.inbox.error ? h('div', { class: 'error-box' }, status.inbox.error) : null) : null,
     h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, '保存先'),
       st ? h('div', { class: st.available ? 'ok-box' : 'error-box' }, st.available ? '共有フォルダに接続しています。' : `接続できません：${st.error}`) : null,
       h('p', { class: 'small' }, `データ：${st?.dataDir ?? '-'}`, h('br'), `バックアップ：${st?.backupDir ?? '-'}`),
-      status && !status.secure ? h('p', { class: 'small muted' }, '現在 HTTP で接続しています。社内証明書で HTTPS を構成すると通信が暗号化されます（導入手順書を参照）。') : null),
-    !isAdmin ? h('p', { class: 'small muted' }, 'バックアップ・復元・CSV出力は管理者のみ利用できます。') : null,
+    ),
     !isAdmin ? null : h('div', { class: 'panel' }, h('h2', { class: 'mt0' }, 'バックアップ'),
       h('p', { class: 'small muted' }, '自動バックアップは画像を含む全件を世代管理で保存します。バックアップが同じ共有ストレージ（NAS）内にある場合、ストレージ自体の故障には備えられません。定期的に「ダウンロード」して別の社内媒体にも保管してください。'),
       h('div', { class: 'row' }, mkBtn), h('div', { class: 'mt12' }, list)),

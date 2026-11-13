@@ -53,13 +53,45 @@ test('同時保存：同じ版からの並行更新は1件だけ成功し、他�
   await store.close();
 });
 
-test('二重起動を拒否する（.lock）', async () => {
+test('複数の PC：同じ版からの同時更新は PC をまたいでも1件だけ成功', async () => {
   const { store, dataDir, backupDir } = await tempStore();
-  const other = new Store({ dataDir, backupDir });
-  await assert.rejects(other.open(), (e: StoreError) => e.code === 'LOCKED');
+  const pc2 = new Store({ dataDir, backupDir });
+  await pc2.open();
+  const c = await store.create(f({ name: '共有' }));
+  const rs = await Promise.allSettled([
+    ...[1, 2, 3].map((i) => store.update(c.id, 1, f({ name: `PC1-${i}` }))),
+    ...[1, 2, 3].map((i) => pc2.update(c.id, 1, f({ name: `PC2-${i}` }))),
+  ]);
+  assert.equal(rs.filter((r) => r.status === 'fulfilled').length, 1);
+  assert.ok(rs.filter((r) => r.status === 'rejected').every((r) => ['CONFLICT', 'LOCKED'].includes(((r as PromiseRejectedResult).reason as StoreError).code)));
+  await pc2.refresh(true);
+  assert.equal(pc2.get(c.id)?.version, 2);
+  // 放棄されたロック（PC の停止など）は30秒で無効
+  const lock = path.join(dataDir, 'locks', `card-${c.id}.lock`);
+  await fs.writeFile(lock, '{}');
+  const old = new Date(Date.now() - 60_000);
+  await fs.utimes(lock, old, old);
+  assert.equal((await store.update(c.id, 2, f({ name: '引き継ぎ' }))).version, 3);
+  await pc2.close();
   await store.close();
-  await other.open();
-  await other.close();
+});
+
+test('復元中は他の PC の保存を止める', async () => {
+  const { store, dataDir, backupDir } = await tempStore();
+  const pc2 = new Store({ dataDir, backupDir });
+  await pc2.open();
+  const c = await store.create(f({ name: '復元前' }));
+  const b = await store.createBackup('manual');
+  await fs.writeFile(path.join(dataDir, 'locks', 'maintenance.lock'), '{}');
+  await assert.rejects(pc2.update(c.id, 1, f({ name: '復元中' })), (e: StoreError) => e.code === 'MAINTENANCE');
+  await assert.rejects(pc2.create(f({ name: '復元中' })), (e: StoreError) => e.code === 'MAINTENANCE');
+  await fs.unlink(path.join(dataDir, 'locks', 'maintenance.lock'));
+  await pc2.create(f({ name: '追加' }));
+  await store.restore(store.backupPath(b.name));
+  await pc2.refresh(true);
+  assert.deepEqual(pc2.list().map((x) => x.name), ['復元前'], '他の PC も復元後の内容を読む');
+  await pc2.close();
+  await store.close();
 });
 
 test('共有フォルダ切断：保存失敗を返し、元の場所に黙って作り直さない', async () => {
@@ -74,26 +106,30 @@ test('共有フォルダ切断：保存失敗を返し、元の場所に黙っ�
   assert.equal(store.available, false);
   assert.equal(store.get(c.id)?.name, '切断前', 'メモリ上の内容は変わっていない');
   await fs.rename(moved, path.join(root, 'share'));
-  await store.tick();
+  await store.probe();
   assert.equal(store.available, true);
   const again = await store.update(c.id, 1, f({ name: '再接続後' }));
   assert.equal(again.version, 2);
   await store.close();
 });
 
-test('書き込み途中の一時ファイルは起動時に掃除され、本体は壊れない', async () => {
+test('古い一時ファイルは起動時に掃除され、壊れたファイルは一覧から除外（削除しない）', async () => {
   const { store, dataDir, backupDir } = await tempStore();
   const c = await store.create(f({ name: '原本' }));
   await store.close();
   await fs.writeFile(path.join(dataDir, 'cards', `.tmp-${c.id}.json-dead`), '{"broken":');
+  const old = new Date(Date.now() - 2 * 3600_000);
+  await fs.utimes(path.join(dataDir, 'cards', `.tmp-${c.id}.json-dead`), old, old);
+  await fs.writeFile(path.join(dataDir, 'cards', '.tmp-writing-now'), '{"other pc":');
   await fs.writeFile(path.join(dataDir, 'cards', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json'), '{"broken":');
   const s2 = new Store({ dataDir, backupDir });
   await s2.open();
   assert.equal(s2.get(c.id)?.name, '原本');
   assert.equal(s2.list().length, 1);
   const files = await fs.readdir(path.join(dataDir, 'cards'));
-  assert.ok(!files.some((x) => x.startsWith('.tmp-')));
-  assert.ok(files.some((x) => x.includes('.invalid-')), '壊れたファイルは削除せず退避');
+  assert.ok(!files.includes(`.tmp-${c.id}.json-dead`), '古い一時ファイルは掃除');
+  assert.ok(files.includes('.tmp-writing-now'), '他の PC が書き込み中かもしれない新しい一時ファイルは残す');
+  assert.ok(files.includes('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json'), '壊れたファイルは削除せず残す（一覧からは除外）');
   await s2.close();
 });
 

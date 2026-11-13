@@ -7,8 +7,9 @@ import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { AppConfig } from './config.js';
 import { Store, StoreError } from './store.js';
-import { Auth, User } from './auth.js';
-import { Inbox } from './inbox.js';
+import { Inbox, InboxGoneError } from './inbox.js';
+
+export interface User { id: string; name: string }
 import { Card, ID_RE, ValidationError, norm, parseCardFields } from './card.js';
 import { toCsv } from './csv.js';
 import { log } from './log.js';
@@ -68,27 +69,28 @@ async function readJson(req: http.IncomingMessage): Promise<Record<string, unkno
   }
 }
 
-function cookies(req: http.IncomingMessage): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const part of (req.headers.cookie ?? '').split(';')) {
-    const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return out;
-}
-
 export function summary(c: Card) {
   return {
     id: c.id, version: c.version, company: c.company, department: c.department, title: c.title, name: c.name, kana: c.kana,
     exchangeDate: c.exchangeDate, event: c.event, category: c.category, tags: c.tags, createdAt: c.createdAt, updatedAt: c.updatedAt,
-    hasImage: !!c.frontImage,
+    frontImage: c.frontImage,
   };
 }
 
-export interface AppDeps { config: AppConfig; store: Store; auth: Auth; secure: boolean; inbox?: Inbox }
+/**
+ * デスクトップアプリ内で使うリクエスト処理。アプリ独自のプロトコル（app://）経由で画面から呼ばれ、ネットワークには公開しない。
+ * 利用者はこの PC の Windows ユーザー（アクセス権は共有フォルダの権限で管理）。
+ */
+export interface AppDeps {
+  config: Pick<AppConfig, 'publicDir' | 'maxImageBytes' | 'maxRestoreBytes'>;
+  store: Store;
+  user: User;
+  /** 利用者IDから表示名（共有フォルダの users.json） */
+  displayName?: (id: string) => string;
+  inbox?: Inbox;
+}
 
-export function createHandler({ config, store, auth, secure, inbox }: AppDeps): http.RequestListener {
-  const COOKIE = secure ? '__Host-meishi_sid' : 'meishi_sid';
+export function createHandler({ config, store, user, inbox, displayName = (id) => id }: AppDeps): http.RequestListener {
   const ocrAvailable = fs.existsSync(path.join(config.publicDir, 'vendor', 'ocr', 'lang', 'jpn.traineddata.gz'));
   const pending = new Map<string, { file: string; at: number }>();
 
@@ -155,58 +157,40 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
     return { events: arr(events), tags: arr(tags) };
   }
 
-  async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL, token: string | undefined): Promise<void> {
+  async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
     const m = req.method ?? 'GET';
     const p = url.pathname;
-
-    if (p === '/api/session' && m === 'GET') {
-      const u = auth.check(token);
-      return json(res, 200, { authenticated: !!u, user: u, configured: auth.configured() });
-    }
-    if (p === '/api/login' && m === 'POST') {
-      const body = await readJson(req);
-      const str = (v: unknown) => (typeof v === 'string' ? v.slice(0, 200) : '');
-      const r = auth.login(str(body.userId), str(body.password), req.socket.remoteAddress ?? '');
-      if (!r.ok) {
-        log('warn', 'login failed', { locked: r.locked });
-        throw new HttpError(r.locked ? 429 : 401, r.locked ? 'ログインの失敗が続いたため、しばらく待ってから再度お試しください。' : 'パスワードが違います。');
-      }
-      log('info', 'login ok', { user: r.user.id });
-      res.setHeader('Set-Cookie', `${COOKIE}=${r.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${r.maxAge}${secure ? '; Secure' : ''}`);
-      return json(res, 200, { ok: true });
-    }
-    if (p === '/api/logout' && m === 'POST') {
-      auth.logout(token);
-      res.setHeader('Set-Cookie', `${COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? '; Secure' : ''}`);
-      return json(res, 200, { ok: true });
-    }
-
-    // ---- ここから下はすべて認証必須 ----
-    const user: User | null = auth.check(token);
-    if (!user) throw new HttpError(401, 'ログインしてください。');
-    const adminOnly = () => { if (user.role !== 'admin') throw new HttpError(403, 'この操作は管理者のみ実行できます。'); };
 
     if (p === '/api/status' && m === 'GET') {
       return json(res, 200, {
         storage: { available: store.available, error: store.lastError, dataDir: store.dataDir, backupDir: store.backupDir },
         inbox: inbox ? { enabled: true, dir: inbox.dir, error: inbox.lastError } : { enabled: false },
-        ocrAvailable, secure, user,
+        ocrAvailable, user,
       });
     }
-    if (p === '/api/cards' && m === 'GET') return json(res, 200, listCards(url.searchParams));
-    if (p === '/api/facets' && m === 'GET') return json(res, 200, facets());
+    if (p === '/api/cards' && m === 'GET') { await store.refresh(); return json(res, 200, listCards(url.searchParams)); }
+    if (p === '/api/facets' && m === 'GET') { await store.refresh(); return json(res, 200, facets()); }
     if (p === '/api/cards' && m === 'POST') {
       const body = await readJson(req);
       const fields = parseCardFields(body);
       const fromInbox = Array.isArray(body.fromInbox) ? body.fromInbox : [];
       if (fromInbox.length > 2 || fromInbox.some((x) => typeof x !== 'string' || !ID_RE.test(x))) throw new HttpError(400, '取り込み画像の指定が不正です。');
       if (fromInbox.length && !inbox) throw new HttpError(400, '取り込み用フォルダが設定されていません。');
-      if (inbox && fromInbox.some((x) => !inbox.get(x as string))) throw new HttpError(409, 'この画像は既に他の利用者が取り込んだか、移動・削除されています。「未整理」の一覧を更新してください。');
-      const card = await store.create(fields, user.id);
-      log('info', 'card created', { id: card.id, user: user.id });
-      // 名刺の保存が確定してから元画像を取り込み済みへ移動。移動に失敗しても名刺は保存済みとして返し、警告を付ける
-      const moved = fromInbox.length && inbox ? await inbox.complete(fromInbox as string[], 'registered') : undefined;
-      return json(res, 201, { ...card, inboxResult: moved });
+      if (!fromInbox.length || !inbox) {
+        const card = await store.create(fields, user.id);
+        log('info', 'card created', { id: card.id, user: user.id });
+        return json(res, 201, card);
+      }
+      // 取り込み用フォルダの画像から登録：PC 間ロックの中で「元画像が残っている」ことを確かめてから名刺を保存し、
+      // 保存が確定した後に元画像を取り込み済みへ移動（他の PC との二重登録を防ぐ）。移動に失敗しても名刺は保存済み
+      try {
+        const r = await inbox.completeWith(fromInbox as string[], 'registered', () => store.create(fields, user.id));
+        log('info', 'card created', { id: r.value.id, user: user.id, fromInbox: r.moved });
+        return json(res, 201, { ...r.value, inboxResult: { moved: r.moved, failed: r.failed } });
+      } catch (e) {
+        if (e instanceof InboxGoneError) throw new HttpError(409, e.message);
+        throw e;
+      }
     }
     if (p === '/api/duplicates' && m === 'POST') {
       const body = await readJson(req);
@@ -218,9 +202,9 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
     if (mm) {
       const id = mm[1]!;
       if (m === 'GET') {
-        const c = store.get(id);
-        if (!c) throw new HttpError(404, '名刺が見つかりません。');
-        return json(res, 200, { ...c, createdByName: c.createdBy ? auth.displayName(c.createdBy) : '', updatedByName: c.updatedBy ? auth.displayName(c.updatedBy) : '' });
+        const c = await store.getFresh(id);
+        if (!c) throw new HttpError(404, '名刺が見つかりません（他のPCで削除された可能性があります）。');
+        return json(res, 200, { ...c, createdByName: c.createdBy ? displayName(c.createdBy) : '', updatedByName: c.updatedBy ? displayName(c.updatedBy) : '' });
       }
       if (m === 'PUT') {
         const body = await readJson(req);
@@ -232,7 +216,7 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
       }
       if (m === 'DELETE') {
         const base = Number(url.searchParams.get('baseVersion'));
-        await store.remove(id, base);
+        await store.remove(id, base, user.id);
         log('info', 'card deleted', { id, user: user.id });
         return json(res, 200, { ok: true });
       }
@@ -266,7 +250,7 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
     if (p.startsWith('/api/inbox')) {
       if (!inbox) throw new HttpError(404, '取り込み用フォルダが設定されていません。');
       if (p === '/api/inbox' && m === 'GET') {
-        const items = (await inbox.scan()).map((x) => ({ ...x, claimedBy: x.claimedBy && x.claimedBy !== user.id ? auth.displayName(x.claimedBy) : undefined }));
+        const items = (await inbox.scan()).map((x) => ({ ...x, claimedBy: x.claimedBy && x.claimedBy !== user.id ? displayName(x.claimedBy) : undefined }));
         return json(res, 200, { items });
       }
       if (p === '/api/inbox/upload' && m === 'POST') {
@@ -298,12 +282,10 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
       }
       if (im && it && im[2] === 'claim' && m === 'POST') {
         const other = inbox.claim(it.id, user.id);
-        return json(res, 200, { claimedBy: other ? auth.displayName(other) : null });
+        return json(res, 200, { claimedBy: other ? displayName(other) : null });
       }
       throw new HttpError(404, '見つかりません。');
     }
-    // ---- 以下は全件の持ち出し・置き換えにあたるため管理者のみ ----
-    if (/^\/api\/(export\.csv|backups|restore)/.test(p)) adminOnly();
     if (p === '/api/export.csv' && m === 'GET') {
       const cards = store.list().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       const name = `meishi-${new Date().toISOString().slice(0, 10)}.csv`;
@@ -367,7 +349,6 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(self)');
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-    if (secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
     const url = new URL(req.url ?? '/', 'http://localhost');
     const isApi = url.pathname.startsWith('/api/');
     const run = async () => {
@@ -380,7 +361,7 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
           const origin = req.headers.origin;
           if (origin && new URL(origin).host !== req.headers.host) throw new HttpError(403, '不正なリクエストです。');
         }
-        await api(req, res, url, cookies(req)[COOKIE]);
+        await api(req, res, url);
       } else if (req.method === 'GET' || req.method === 'HEAD') {
         await serveStatic(req, res, url.pathname);
       } else {
@@ -394,7 +375,7 @@ export function createHandler({ config, store, auth, secure, inbox }: AppDeps): 
       if (e instanceof HttpError) { status = e.status; msg = e.message; extra = e.extra ?? {}; }
       else if (e instanceof ValidationError) { status = 400; msg = e.message; }
       else if (e instanceof StoreError) {
-        status = { STORAGE_UNAVAILABLE: 503, CONFLICT: 409, NOT_FOUND: 404, LOCKED: 503, INVALID: 400 }[e.code];
+        status = { STORAGE_UNAVAILABLE: 503, CONFLICT: 409, NOT_FOUND: 404, LOCKED: 503, INVALID: 400, MAINTENANCE: 503 }[e.code];
         msg = e.message;
         if (e.current) extra = { current: e.current };
         extra.code = e.code;

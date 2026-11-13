@@ -1,0 +1,6 @@
+{
+  "dataDir": "\\\\fileserver\\share\\meishi",
+  "inboxDir": "\\\\fileserver\\share\\meishi-inbox",
+  "inboxRetentionDays": 90,
+  "autoBackup": { "intervalHours": 24, "keep": 14 }
+}

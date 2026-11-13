@@ -2,8 +2,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 const i = process.argv.indexOf('--log');
-const logFile = i > 0 ? process.argv[i + 1] : undefined;
+let logFile = i > 0 ? process.argv[i + 1] : undefined;
 if (logFile) fs.mkdirSync(path.dirname(path.resolve(logFile)), { recursive: true });
+/** ログの出力先ファイルを設定（デスクトップアプリでは %APPDATA%\MeishiKanri\logs） */
+export function setLogFile(file: string): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  logFile = file;
+}
 type Level = 'info' | 'warn' | 'error';
 export function log(level: Level, msg: string, meta?: Record<string, string | number | boolean | undefined>): void {
   if (process.env.MEISHI_QUIET === '1' && level === 'info') return;

@@ -14,6 +14,10 @@ import { StoreError } from './store.js';
 import { log } from './log.js';
 import { extractJpegsFromPdf, isPdf } from './pdf.js';
 
+export class InboxGoneError extends Error {
+  constructor() { super('この画像は既に他の利用者が取り込んだか、移動・削除されています。「未整理」の一覧を更新してください。'); }
+}
+
 export const INBOX_EXT: Record<string, string> = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp',
   '.heic': 'image/heic', '.heif': 'image/heif', '.pdf': 'application/pdf',
@@ -29,16 +33,15 @@ export class Inbox {
   private items = new Map<string, InboxItem & { file: string }>();
   private claims = new Map<string, { user: string; at: number }>();
   private pdfErrors = new Map<string, string>();
-  private chain: Promise<unknown> = Promise.resolve();
   lastError = '';
 
-  constructor(readonly dir: string, readonly doneDir: string, private retentionDays: number) {}
+  /**
+   * @param lock PC 間の排他（共有フォルダ上のロックファイル）。PDF の分割・取り込み済みへの移動・追加はこの中で行う
+   */
+  constructor(readonly dir: string, readonly doneDir: string, private retentionDays: number,
+    private lock: <T>(fn: () => Promise<T>) => Promise<T> = (fn) => fn()) {}
 
-  private serial<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(fn, fn);
-    this.chain = run.catch(() => undefined);
-    return run;
-  }
+  private serial<T>(fn: () => Promise<T>): Promise<T> { return this.lock(fn); }
 
   async scan(): Promise<InboxItem[]> {
     let names: string[];
@@ -157,12 +160,24 @@ export class Inbox {
     await fs.unlink(it.file);
   }
 
-  complete(ids: string[], reason: 'registered' | 'discarded'): Promise<{ moved: number; failed: string[] }> {
+  /**
+   * 取り込み済みフォルダへ移動する。strict のときは、全ファイルが残っていることを確認してから before（名刺の保存）を実行し、
+   * 1つでも無ければ何もせず InboxGoneError（他の PC が先に取り込んだ等）。
+   */
+  completeWith<T>(ids: string[], reason: 'registered' | 'discarded', before: () => Promise<T>, strict = true): Promise<{ value: T; moved: number; failed: string[] }> {
     return this.serial(async () => {
-      let moved = 0;
-      const failed: string[] = [];
+      const targets: { id: string; it?: InboxItem & { file: string } }[] = [];
       for (const id of ids) {
         const it = this.items.get(id);
+        let ok = !!it;
+        if (it) { try { await fs.access(it.file); } catch { ok = false; } }
+        if (!ok && strict) throw new InboxGoneError();
+        targets.push({ id, it: ok ? it : undefined });
+      }
+      const value = await before();
+      let moved = 0;
+      const failed: string[] = [];
+      for (const { id, it } of targets) {
         if (!it) { failed.push(id); continue; }
         try {
           await this.moveToDone(it, reason);
@@ -174,8 +189,13 @@ export class Inbox {
           failed.push(id);
         }
       }
-      return { moved, failed };
+      return { value, moved, failed };
     });
+  }
+
+  async complete(ids: string[], reason: 'registered' | 'discarded'): Promise<{ moved: number; failed: string[] }> {
+    const { moved, failed } = await this.completeWith(ids, reason, async () => undefined, false);
+    return { moved, failed };
   }
 
   /** 取り込み済みフォルダの古いファイルを削除（保持日数を過ぎたもの） */

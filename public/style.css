@@ -136,3 +136,26 @@ pre.raw { white-space: pre-wrap; font-size: .8rem; background: var(--bg); paddin
 .inbox-item.sel { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-weak); }
 .inbox-item .ord { position: absolute; top: 12px; left: 12px; background: var(--primary); color: #fff; border-radius: 6px; padding: 0 8px; font-weight: 700; font-size: .85rem; }
 .inbox-item .ord:empty { display: none; }
+
+/* 名刺一覧（名刺画像つき・月ごとのまとまり） */
+.group { margin-bottom: 18px; }
+.group-h { font-size: .95rem; margin: 14px 0 6px; padding-bottom: 4px; border-bottom: 1px solid var(--line); }
+.cardlist { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr; gap: 8px; }
+@media (min-width: 900px) { .cardlist { grid-template-columns: 1fr 1fr; } }
+@media (min-width: 1400px) { .cardlist { grid-template-columns: 1fr 1fr 1fr; } }
+.card-row { display: flex; gap: 12px; align-items: center; padding: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); text-decoration: none; color: var(--text); min-width: 0; }
+.card-row:hover { border-color: var(--primary); }
+.thumb-s { flex: 0 0 auto; width: 128px; aspect-ratio: 91 / 55; border-radius: 4px; overflow: hidden; background: var(--bg); border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; }
+.thumb-s img { width: 100%; height: 100%; object-fit: cover; }
+.thumb-s .noimg { font-size: .7rem; color: var(--muted); }
+.card-row .info { display: flex; flex-direction: column; min-width: 0; }
+.card-row .nm { font-weight: 700; font-size: 1.02rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-row .kana { font-weight: 400; font-size: .75rem; color: var(--muted); margin-left: 8px; }
+.card-row .co, .card-row .role { font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-row .role { color: var(--muted); }
+.card-row .meta { font-size: .75rem; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
+@media (max-width: 480px) { .thumb-s { width: 96px; } }
+.setup { max-width: 720px; margin: 24px auto; }
+.row.nowrap { flex-wrap: nowrap; }
+.row.nowrap input { flex: 1; min-width: 0; }
+.slot.drop { border-color: var(--primary); background: var(--primary-weak); }
