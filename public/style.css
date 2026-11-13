@@ -159,3 +159,6 @@ pre.raw { white-space: pre-wrap; font-size: .8rem; background: var(--bg); paddin
 .row.nowrap { flex-wrap: nowrap; }
 .row.nowrap input { flex: 1; min-width: 0; }
 .slot.drop { border-color: var(--primary); background: var(--primary-weak); }
+.ai-read .steps { padding-left: 1.4em; margin: 8px 0; }
+.ai-read .steps li { margin-bottom: 10px; }
+.ai-read textarea { min-height: 140px; margin-top: 6px; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }

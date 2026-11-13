@@ -77,3 +77,48 @@ export function parseCardText(text: string): OcrCandidates {
   });
   return out;
 }
+
+// ---------- ChatGPT などの AI での読み取り（コピー＆ペースト。アプリからは送信しない） ----------
+
+/** AI に渡す指示文。回答は JSON だけにしてもらい、アプリが入力候補として読み込む */
+export const AI_PROMPT = `添付の名刺画像（表・裏）から情報を読み取り、次の JSON だけを出力してください。説明文やコードブロックの記号は不要です。
+読み取れない・書かれていない項目は "" にしてください。推測で補わないでください。
+{
+  "company": "会社名",
+  "department": "部署",
+  "title": "役職",
+  "name": "氏名（姓と名の間は半角スペース）",
+  "kana": "氏名のふりがな（ひらがな。名刺に書かれていない場合は \\"\\"）",
+  "phone": "電話番号（代表・直通）",
+  "mobile": "携帯電話番号",
+  "email": "メールアドレス",
+  "postalCode": "郵便番号（123-4567 の形）",
+  "address": "住所（郵便番号を除く）",
+  "website": "Webサイトの URL"
+}`;
+
+const AI_KEYS = ['company', 'department', 'title', 'name', 'kana', 'phone', 'mobile', 'email', 'postalCode', 'address', 'website'] as const;
+const AI_ALIASES: Record<string, (typeof AI_KEYS)[number]> = {
+  会社名: 'company', 部署: 'department', 役職: 'title', 氏名: 'name', ふりがな: 'kana', 電話番号: 'phone', 電話: 'phone',
+  携帯番号: 'mobile', 携帯: 'mobile', メールアドレス: 'email', メール: 'email', 郵便番号: 'postalCode', 住所: 'address', webサイト: 'website', ウェブサイト: 'website', url: 'website',
+};
+
+/** AI の回答（JSON。前後の説明文や ```json を含んでもよい）から入力候補を取り出す */
+export function parseAiAnswer(text: string): OcrCandidates {
+  const t = text.replace(/```(?:json)?/gi, '');
+  const a = t.indexOf('{');
+  const b = t.lastIndexOf('}');
+  if (a < 0 || b <= a) throw new Error('回答に JSON が見つかりません。ChatGPT の回答全体をコピーして貼り付けてください。');
+  let obj: unknown;
+  try { obj = JSON.parse(t.slice(a, b + 1)); } catch { throw new Error('回答の JSON を読み取れませんでした。もう一度 ChatGPT に「JSON だけを出力して」と頼んでください。'); }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('回答の形式が想定と違います。');
+  const out: OcrCandidates = {};
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    const key = (AI_KEYS as readonly string[]).includes(k) ? (k as (typeof AI_KEYS)[number]) : AI_ALIASES[k.toLowerCase()] ?? AI_ALIASES[k];
+    if (!key || typeof v !== 'string') continue;
+    const val = v.normalize('NFKC').replace(/\s+/g, ' ').trim().slice(0, 300);
+    if (val) out[key] = val;
+  }
+  if (!Object.keys(out).length) throw new Error('回答から読み取れた項目がありません。');
+  return out;
+}
