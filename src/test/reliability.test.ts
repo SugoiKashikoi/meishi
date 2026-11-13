@@ -50,7 +50,7 @@ test('ロック：更新停止をスリープと区別できない場合、二�
     const old = new Date(Date.now() - 60000);
     await fs.utimes(lock, old, old);
     let called = false;
-    await assert.rejects(store.withLock('review', async () => { called = true; }, 0), (e: StoreError) => e.code === 'LOCKED');
+    await assert.rejects(store.withLock('review', async () => { called = true; }, 0), (e: StoreError) => e.code === 'STALE_LOCK');
     assert.equal(called, false);
     assert.equal(await fs.readFile(lock, 'utf8'), before);
   } finally { release(); await first; }

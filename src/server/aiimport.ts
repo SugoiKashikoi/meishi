@@ -8,6 +8,7 @@
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { Store, StoreError } from './store.js';
 import { Inbox, InboxGoneError } from './inbox.js';
 import { CATEGORIES, CATEGORY_LABELS, parseCardFields, ValidationError } from './card.js';
@@ -71,13 +72,14 @@ export interface AiImportResult {
   duplicates?: { id: string; company: string; name: string }[];
   movedFromInbox?: number;
   inboxMoveFailed?: string[];
+  saved?: boolean;
+  alreadyRegistered?: boolean;
 }
 
 const CAT_BY_LABEL: Record<string, string> = Object.fromEntries(Object.entries(CATEGORY_LABELS).filter(([k]) => k).map(([k, v]) => [v, k]));
 
-async function loadImages(file: string): Promise<Buffer[]> {
+async function loadImages(file: string, buf: Buffer): Promise<Buffer[]> {
   const ext = path.extname(file).toLowerCase();
-  const buf = await fs.readFile(file);
   if (ext === '.pdf') return extractJpegsFromPdf(buf, { max: 2 });
   if (ext === '.jpg' || ext === '.jpeg') return [buf];
   throw new ValidationError(`画像は JPEG か PDF にしてください: ${path.basename(file)}`);
@@ -106,8 +108,28 @@ export async function aiImport(
       // 画像
       const files = (['frontImageFile', 'backImageFile'] as const)
         .map((k) => (typeof e[k] === 'string' && e[k] ? path.resolve(opts.baseDir, e[k] as string) : null));
+      const canonical = (file: string) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
+      const samePath = (a: string, b: string) => canonical(a) === canonical(b);
+      const hash = (bytes: Buffer) => crypto.createHash('sha256').update(bytes).digest('hex');
+      const originals: { file: string; bytes?: Buffer; hash?: string }[] = [];
+      for (const file of files) if (file) {
+        try { const bytes = await fs.readFile(file); originals.push({ file: canonical(file), bytes, hash: hash(bytes) }); }
+        catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+          originals.push({ file: canonical(file) });
+        }
+      }
+      const missing = originals.some(s => !s.bytes);
+      if (missing) {
+        // 前回、一部の原本だけ移動できた場合も、保存済み記録と照合して移動だけ再試行する。
+        const previous = store.list().find(c => c.aiSources?.length === originals.length
+          && originals.every(s => c.aiSources!.some(p => samePath(p.file, s.file) && (!s.hash || p.hash === s.hash))));
+        if (!previous) throw new ValidationError('元写真が見つかりません。登録済みの記録と照合できないため中止しました。');
+        for (const source of originals) source.hash ??= previous.aiSources!.find(s => samePath(s.file, source.file))!.hash;
+      }
+      const sources = originals.map(s => ({ file: s.file, hash: s.hash! }));
       let imgs: Buffer[] = [];
-      for (const f of files) if (f) imgs.push(...(await loadImages(f)));
+      if (!missing) for (const source of originals) imgs.push(...(await loadImages(source.file, source.bytes!)));
       imgs = imgs.slice(0, 2);
       // 名刺部分だけの切り抜き・回転（1枚目＝表、2枚目＝裏）
       const edits = [
@@ -124,8 +146,8 @@ export async function aiImport(
       }
       const dups = store.duplicates(fields).map((c) => ({ id: c.id, company: c.company, name: c.name }));
       // 新着・巨大・置換済みの取り込み画像を一覧から除外されたまま登録しない。
-      const samePath = (a: string, b: string) => process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
       if (opts.inbox && files.some((f) => f && samePath(path.dirname(f), opts.inbox!.dir)
+        && originals.some(s => samePath(s.file, f) && s.bytes)
         && !inboxItems.some((it) => samePath(path.resolve(opts.inbox!.dir, it.name), f)))) {
         throw new ValidationError('取り込み用の画像が未確定・移動済み・対象外です。保存完了から10秒以上待ち、一覧とファイルを確認して再実行してください。');
       }
@@ -134,16 +156,26 @@ export async function aiImport(
       for (const b of imgs) ids.push(await store.putImage(b));
       fields.frontImage = ids[0] ?? null;
       fields.backImage = ids[1] ?? null;
+      const save = async () => {
+        // 一覧取得・画像処理の間に原本が書き換わった場合は保存も移動もしない。
+        for (const source of originals) if (source.bytes && hash(await fs.readFile(source.file)) !== source.hash) {
+          throw new ValidationError('元写真が変更されました。一覧とファイルを確認して再実行してください。');
+        }
+        return sources.length ? store.createFromAi(fields, opts.user, sources, missing)
+          : { card: await store.create(fields, opts.user), created: true };
+      };
       // 取り込み用フォルダの画像なら、他の PC との二重登録を防いだうえで取り込み済みへ移動
       const inboxIds = opts.inbox
         ? inboxItems.filter((it) => files.some((f) => f && samePath(path.resolve(opts.inbox!.dir, it.name), f))).map((it) => it.id)
         : [];
       if (inboxIds.length && opts.inbox) {
-        const r = await opts.inbox.completeWith(inboxIds, 'registered', () => store.create(fields, opts.user));
-        results.push({ index: i, ok: true, id: r.value.id, label, duplicates: dups, movedFromInbox: r.moved, inboxMoveFailed: r.failed });
+        const r = await opts.inbox.completeWith(inboxIds, 'registered', save);
+        results.push({ index: i, ok: !r.failed.length, saved: true, alreadyRegistered: !r.value.created, id: r.value.card.id, label, duplicates: dups,
+          movedFromInbox: r.moved, inboxMoveFailed: r.failed,
+          ...(r.failed.length ? { error: '名刺は保存済みですが、元写真を移動できませんでした。同じフォームを再実行すると登録済み名刺を使って移動だけ再試行します。' } : {}) });
       } else {
-        const c = await store.create(fields, opts.user);
-        results.push({ index: i, ok: true, id: c.id, label, duplicates: dups });
+        const saved = await save();
+        results.push({ index: i, ok: true, saved: true, alreadyRegistered: !saved.created, id: saved.card.id, label, duplicates: dups });
       }
     } catch (err) {
       const msg = err instanceof ValidationError || err instanceof StoreError || err instanceof InboxGoneError ? err.message

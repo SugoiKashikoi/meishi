@@ -24,7 +24,7 @@ import { TarReader, TarWriter } from './tar.js';
 import { sanitizeJpeg } from './jpeg.js';
 import { log } from './log.js';
 
-export type StoreErrorCode = 'STORAGE_UNAVAILABLE' | 'CONFLICT' | 'NOT_FOUND' | 'LOCKED' | 'INVALID' | 'MAINTENANCE';
+export type StoreErrorCode = 'STORAGE_UNAVAILABLE' | 'CONFLICT' | 'NOT_FOUND' | 'LOCKED' | 'STALE_LOCK' | 'INVALID' | 'MAINTENANCE';
 
 export class StoreError extends Error {
   constructor(readonly code: StoreErrorCode, message: string, readonly current?: Card) {
@@ -36,7 +36,7 @@ const MARKER = '.meishi-store';
 const RESTORE_MARKER = 'restore-in-progress.json';
 const ORPHAN_IMAGE_AGE_MS = 24 * 3600_000;
 export const BACKUP_FORMAT = 'meishi-backup';
-const BACKUP_NAME_RE = /^meishi-(\d{8}-\d{6})-(auto|manual|pre-restore)(-\d+)?\.tar$/;
+const BACKUP_NAME_RE = /^meishi-(\d{8}-\d{6})-(auto|manual|pre-restore|preservation)(-\d+)?\.tar$/;
 
 export const newId = (): string => crypto.randomBytes(16).toString('hex');
 const sha256 = (b: Buffer): string => crypto.createHash('sha256').update(b).digest('hex');
@@ -104,6 +104,7 @@ export class Store {
   private refreshing: Promise<void> | null = null;
   available = false;
   lastError = '';
+  backupError = '';
   get unreadableCards(): number { return this.invalidCards.size; }
 
   constructor(opts: StoreOptions) {
@@ -137,10 +138,12 @@ export class Store {
   async open(): Promise<void> {
     await this.checkMarker();
     await this.assertNoMaintenance();
-    // 起動・復元再開も同じロックで保護し、別PCが復元中のディレクトリを作り直さない。
-    await this.withLock('maintenance', async () => {
-      await this.recoverRestore();
-      for (const d of ['cards', 'images', 'trash', 'tmp', 'locks']) await fs.mkdir(this.p(d), { recursive: true });
+    if (await exists(this.p(RESTORE_MARKER))) {
+      await this.withLock('maintenance', () => this.recoverRestore());
+    }
+    // 通常起動は他PCの保存を止めない。欠落したcards/imagesを作り直さない。
+    await this.read(async () => {
+      for (const d of ['cards', 'images', 'trash', 'tmp', 'locks']) await fs.access(this.p(d));
       await fs.mkdir(this.backupDir, { recursive: true });
       await this.cleanTemp();
       await this.doRefresh(true);
@@ -179,7 +182,7 @@ export class Store {
         const code = (e as NodeJS.ErrnoException).code;
         if (code !== 'EEXIST') throw e;
         const age = await this.lockAge(name);
-        if (age !== null && age > LOCK_STALE_MS) throw new StoreError('LOCKED', '更新が止まったロックがあります。全PCのアプリ・登録コマンドを終了し、管理者がロックを確認してください。自動解除はしません。');
+        if (age !== null && age > LOCK_STALE_MS) throw new StoreError('STALE_LOCK', '更新が止まったロックがあります。全PCのアプリ・登録コマンドを終了し、管理者がロックを確認してください。自動解除はしません。');
         if (Date.now() > until) {
           throw new StoreError('LOCKED', name === 'maintenance' ? '他のPCで復元作業中です。終わってから再度お試しください。' : '他のPCが同じデータを処理中です。少し待ってから再度お試しください。');
         }
@@ -407,6 +410,23 @@ export class Store {
     });
   }
 
+  /** 元写真の記録と名刺を同じJSONへ保存し、PC間でも再実行を直列化する。 */
+  createFromAi(fields: CardFields, userId: string, sources: NonNullable<Card['aiSources']>, mustExist = false): Promise<{ card: Card; created: boolean }> {
+    return this.write('card-ai-import', async () => {
+      await this.doRefresh(true);
+      if (this.invalidCards.size) throw new StoreError('INVALID', '読めない名刺があるため、AI登録の重複確認ができません。管理者に連絡してください。');
+      const hashes = [...new Set(sources.map(s => s.hash))].sort().join(':');
+      const existing = [...this.cards.values()].find(c => c.aiSources?.length && [...new Set(c.aiSources.map(s => s.hash))].sort().join(':') === hashes);
+      if (existing) return { card: existing, created: false };
+      if (mustExist) throw new StoreError('INVALID', '元写真が見つからず、登録済みの名刺も確認できません。再登録を中止しました。');
+      await this.assertImages(fields);
+      const now = new Date().toISOString();
+      const card: Card = { ...fields, id: newId(), version: 1, createdAt: now, updatedAt: now, createdBy: userId, updatedBy: userId, aiSources: sources };
+      await this.writeCard(card);
+      return { card, created: true };
+    });
+  }
+
   update(id: string, baseVersion: number, fields: CardFields, userId?: string): Promise<Card> {
     return this.write(`card-${id}`, async () => {
       const cur = await this.readDisk(id);
@@ -497,6 +517,53 @@ export class Store {
 
   // ---------- バックアップ ----------
 
+  /** 破損データは修正・除外せず退避する。通常の復元には使わない保全用tar。maintenance/jobs保持中のみ呼ぶ。 */
+  private async preserveBeforeRestore(): Promise<BackupInfo> {
+    let name = `meishi-${stamp()}-preservation.tar`;
+    for (let i = 2; await exists(path.join(this.backupDir, name)); i++) name = `meishi-${stamp()}-preservation-${i}.tar`;
+    const tmp = path.join(this.backupDir, `.tmp-${name}`);
+    let writer: TarWriter | undefined;
+    try {
+      writer = await TarWriter.create(tmp);
+      const files: Record<string, string> = {};
+      const addDir = async (dir: string): Promise<void> => {
+        for (const entry of await fs.readdir(this.p(dir), { withFileTypes: true })) {
+          const relative = `${dir}/${entry.name}`;
+          if (entry.isDirectory()) { await addDir(relative); continue; }
+          if (!entry.isFile()) throw new Error('保存先に通常ファイル以外が含まれています。');
+          const bytes = await fs.readFile(this.p(relative));
+          files[relative] = sha256(bytes);
+          await writer!.add(relative, bytes);
+        }
+      };
+      for (const dir of ['cards', 'images', 'trash']) await addDir(dir);
+      await writer.add('manifest.json', Buffer.from(JSON.stringify({ format: 'meishi-preservation', formatVersion: 1, files })));
+      await writer.finish(); writer = undefined;
+      const reader = await TarReader.open(tmp);
+      try {
+        if (reader.entries.length !== Object.keys(files).length + 1) throw new Error('保全ファイル数が一致しません。');
+        const names = new Set<string>();
+        for (const entry of reader.entries) {
+          if (names.has(entry.name)) throw new Error('保全ファイルが重複しています。');
+          names.add(entry.name);
+          const bytes = await reader.read(entry);
+          if (entry.name === 'manifest.json') {
+            const manifest = JSON.parse(bytes.toString('utf8'));
+            if (manifest.format !== 'meishi-preservation' || JSON.stringify(manifest.files) !== JSON.stringify(files)) throw new Error('保全情報が一致しません。');
+          } else if (sha256(bytes) !== files[entry.name]) throw new Error('保全ファイルのハッシュが一致しません。');
+        }
+      } finally { await reader.close(); }
+      await fs.rename(tmp, path.join(this.backupDir, name));
+      const st = await fs.stat(path.join(this.backupDir, name));
+      log('warn', 'damaged store preserved before restore', { files: Object.keys(files).length });
+      return { name, kind: 'preservation', createdAt: st.mtime.toISOString(), size: st.size };
+    } catch {
+      await writer?.abort();
+      await fs.unlink(tmp).catch(() => undefined);
+      throw new StoreError('STORAGE_UNAVAILABLE', '破損データの保全に失敗したため、復元を中止しました。保存先の接続と空き容量を確認してください。');
+    }
+  }
+
   async listBackups(): Promise<BackupInfo[]> {
     const out: BackupInfo[] = [];
     for (const f of await fs.readdir(this.backupDir)) {
@@ -522,7 +589,10 @@ export class Store {
     return this.withLock('jobs', async () => {
       if (kind === 'pre-restore') await this.doRefresh(true);
       else { await this.assertNoMaintenance(); await this.refresh(true); }
-      if (this.invalidCards.size) throw new StoreError('INVALID', '読めない名刺があるため、バックアップを中止しました。元ファイルを確認してください。');
+      if (this.invalidCards.size) {
+        if (kind === 'pre-restore') return this.preserveBeforeRestore();
+        throw new StoreError('INVALID', '読めない名刺があるため、バックアップを中止しました。元ファイルを確認してください。');
+      }
       const cards = [...this.cards.values()].map((c) => ({ ...c }));
       const images = new Set<string>();
       for (const c of cards) { if (c.frontImage) images.add(c.frontImage); if (c.backImage) images.add(c.backImage); }
@@ -568,10 +638,15 @@ export class Store {
     if (last && Date.now() - Date.parse(last.createdAt) < intervalHours * 3600_000 - 60_000) return null;
     try {
       const b = await this.createBackup('auto');
+      this.backupError = '';
       await this.pruneBackups(keep);
       return b;
     } catch (e) {
       if (e instanceof StoreError && e.code === 'LOCKED') return null; // 他の PC が実行中
+      this.backupError = e instanceof StoreError && e.code === 'STALE_LOCK'
+        ? '残留ロックにより自動バックアップが停止しています。管理者が導入手順の復旧方法を確認してください。'
+        : '自動バックアップに失敗しました。保存先・空き容量・読めない名刺を確認してください。';
+      log('error', 'auto backup stopped', { code: e instanceof StoreError ? e.code : 'IO_ERROR' });
       throw e;
     }
   }
@@ -589,6 +664,7 @@ export class Store {
       const me = r.entries.find((e) => e.name === 'manifest.json');
       if (!me || me.size > 50 * 1024 * 1024) throw new Error('manifest.json がありません。');
       const m = JSON.parse((await r.read(me)).toString('utf8')) as Manifest;
+      if (m.format === 'meishi-preservation') throw new Error('これは破損データの保全用アーカイブです。管理者が展開して確認してください。通常の復元には使えません。');
       if (m.format !== BACKUP_FORMAT || m.formatVersion !== 1) throw new Error('このアプリのバックアップではありません。');
       if (r.entries.filter((e) => e.name === 'manifest.json').length !== 1) throw new Error('manifest.json が重複しています。');
       const names = new Set<string>();

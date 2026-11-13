@@ -93,7 +93,8 @@ async function main(): Promise<void> {
     const pv = args.indexOf('--preview');
     const previewDir = pv >= 0 && args[pv + 1] ? path.resolve(args[pv + 1]!) : undefined;
     const res = await aiImport(s, input, { baseDir: path.dirname(path.resolve(file)), user, inbox, dryRun: args.includes('--dry-run'), transform: electronTransform, previewDir });
-    console.log(JSON.stringify({ dryRun: args.includes('--dry-run'), registered: res.filter((r) => r.ok && r.id).length, failed: res.filter((r) => !r.ok).length, results: res }, null, 2));
+    console.log(JSON.stringify({ dryRun: args.includes('--dry-run'), registered: res.filter((r) => r.saved && !r.alreadyRegistered).length,
+      alreadyRegistered: res.filter((r) => r.alreadyRegistered).length, failed: res.filter((r) => !r.ok).length, results: res }, null, 2));
     if (res.some((r) => !r.ok)) process.exit(2);
     return;
   }

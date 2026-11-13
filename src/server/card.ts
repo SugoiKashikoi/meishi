@@ -25,6 +25,8 @@ export interface Card extends CardFields {
   /** 登録・最終更新した利用者ID */
   createdBy?: string;
   updatedBy?: string;
+  /** AI登録の再実行用。フォームからは受け付けず、保存処理だけが付与する。 */
+  aiSources?: { file: string; hash: string }[];
 }
 
 export const ID_RE = /^[0-9a-f]{32}$/;
@@ -85,6 +87,13 @@ export function parseStoredCard(input: unknown): Card {
       if (typeof v !== 'string' || v.length > 64) throw new ValidationError('登録者が不正です。');
       card[k] = v;
     }
+  }
+  if (src.aiSources !== undefined) {
+    if (!Array.isArray(src.aiSources) || src.aiSources.length < 1 || src.aiSources.length > 2
+      || src.aiSources.some(s => !s || typeof s.file !== 'string' || s.file.length > 32768 || typeof s.hash !== 'string' || !/^[a-f0-9]{64}$/.test(s.hash))) {
+      throw new ValidationError('AI登録元の記録が不正です。');
+    }
+    card.aiSources = src.aiSources.map(s => ({ file: s.file, hash: s.hash }));
   }
   return card;
 }

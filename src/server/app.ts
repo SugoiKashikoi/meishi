@@ -167,7 +167,7 @@ export function createHandler({ config, store, user, inbox, displayName = (id) =
 
     if (p === '/api/status' && m === 'GET') {
       return json(res, 200, {
-        storage: { unreadableCards: store.unreadableCards, available: store.available, error: store.lastError, dataDir: store.dataDir, backupDir: store.backupDir },
+        storage: { unreadableCards: store.unreadableCards, backupError: store.backupError, available: store.available, error: store.lastError, dataDir: store.dataDir, backupDir: store.backupDir },
         inbox: inbox ? { enabled: true, dir: inbox.dir, error: inbox.lastError } : { enabled: false },
         ocrAvailable, user,
       });
@@ -380,7 +380,7 @@ export function createHandler({ config, store, user, inbox, displayName = (id) =
       if (e instanceof HttpError) { status = e.status; msg = e.message; extra = e.extra ?? {}; }
       else if (e instanceof ValidationError) { status = 400; msg = e.message; }
       else if (e instanceof StoreError) {
-        status = { STORAGE_UNAVAILABLE: 503, CONFLICT: 409, NOT_FOUND: 404, LOCKED: 503, INVALID: 400, MAINTENANCE: 503 }[e.code];
+        status = { STORAGE_UNAVAILABLE: 503, CONFLICT: 409, NOT_FOUND: 404, LOCKED: 503, STALE_LOCK: 503, INVALID: 400, MAINTENANCE: 503 }[e.code];
         msg = e.message;
         if (e.current) extra = { current: e.current };
         extra.code = e.code;

@@ -71,7 +71,7 @@ test('複数の PC：同じ版からの同時更新は PC をまたいでも1件
   await fs.writeFile(lock, '{}');
   const old = new Date(Date.now() - 60_000);
   await fs.utimes(lock, old, old);
-  await assert.rejects(store.update(c.id, 2, f({ name: '引き継ぎ' })), (e: StoreError) => e.code === 'LOCKED');
+  await assert.rejects(store.update(c.id, 2, f({ name: '引き継ぎ' })), (e: StoreError) => e.code === 'STALE_LOCK');
   await fs.unlink(lock); // 全PC停止を確認した管理者の解除を模擬
   assert.equal((await store.update(c.id, 2, f({ name: '引き継ぎ' }))).version, 3);
   await pc2.close();

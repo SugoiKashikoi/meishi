@@ -10,7 +10,7 @@ interface Fields extends Record<TextKey, string> { category: string; tags: strin
 interface Card extends Fields { id: string; version: number; createdAt: string; updatedAt: string; createdByName?: string; updatedByName?: string }
 interface Summary { id: string; version: number; company: string; department: string; title: string; name: string; kana: string; exchangeDate: string; event: string; category: string; tags: string[]; createdAt: string; frontImage: string | null }
 interface User { id: string; name: string }
-interface Status { storage: { unreadableCards: number; available: boolean; error: string; dataDir: string; backupDir: string }; inbox: { enabled: boolean; dir?: string; error?: string }; ocrAvailable: boolean; user: User }
+interface Status { storage: { backupError: string; unreadableCards: number; available: boolean; error: string; dataDir: string; backupDir: string }; inbox: { enabled: boolean; dir?: string; error?: string }; ocrAvailable: boolean; user: User }
 interface InboxItem { id: string; name: string; size: number; mtime: string; type: string; claimedBy?: string; error?: string }
 
 const LABELS: Record<string, string> = {
@@ -76,7 +76,7 @@ async function refreshStatus(): Promise<void> {
   if (location.hash === '#/setup') return;
   try {
     status = await api<Status>('GET', '/api/status');
-    setBanner(status.storage.available ? (status.storage.unreadableCards ? `読み込めない名刺が${status.storage.unreadableCards}件あります。一覧から除外し、画像の自動整理とバックアップを停止しています。管理者に連絡してください。` : '') : `保存先（共有フォルダ）に接続できません。保存はできません。表示中の内容は最後に読み込んだものです。${status.storage.error ? '（' + status.storage.error + '）' : ''}`);
+    setBanner(status.storage.available ? (status.storage.unreadableCards ? `読み込めない名刺が${status.storage.unreadableCards}件あります。一覧から除外し、画像の自動整理とバックアップを停止しています。管理者に連絡してください。` : status.storage.backupError) : `保存先（共有フォルダ）に接続できません。保存はできません。表示中の内容は最後に読み込んだものです。${status.storage.error ? '（' + status.storage.error + '）' : ''}`);
     for (const el of document.querySelectorAll<HTMLElement>('[data-inbox]')) el.hidden = !status.inbox.enabled;
     if (status.inbox.enabled) void api<{ items: InboxItem[] }>('GET', '/api/inbox').then((r) => {
       for (const el of document.querySelectorAll<HTMLElement>('[data-inbox-count]')) { el.textContent = r.items.length ? String(r.items.length) : ''; el.hidden = !r.items.length; }
@@ -688,14 +688,14 @@ async function viewAdmin(): Promise<void> {
   const loadBackups = async () => {
     try {
       const r = await api<{ backups: { name: string; kind: string; createdAt: string; size: number }[] }>('GET', '/api/backups');
-      const kind: Record<string, string> = { auto: '自動', manual: '手動', 'pre-restore': '復元前の退避' };
+      const kind: Record<string, string> = { auto: '自動', manual: '手動', 'pre-restore': '復元前の退避', preservation: '破損データの保全（管理者用）' };
       list.replaceChildren(r.backups.length ? h('table', { class: 'list backups' },
         h('thead', {}, h('tr', {}, h('th', {}, '作成日時'), h('th', {}, '種類'), h('th', {}, 'サイズ'), h('th', {}, '操作'))),
         h('tbody', {}, ...r.backups.map((b) => h('tr', {},
           h('td', {}, new Date(b.createdAt).toLocaleString('ja-JP')), h('td', {}, kind[b.kind] ?? b.kind), h('td', {}, `${(b.size / 1048576).toFixed(1)}MB`),
           h('td', {}, h('div', { class: 'row' },
             h('a', { class: 'btn btn-sm', href: `/api/backups/${encodeURIComponent(b.name)}/download`, download: b.name }, 'ダウンロード'),
-            h('button', { class: 'btn btn-sm', onclick: () => void prepRestore({ backupName: b.name }) }, 'この時点に復元'))))))) : h('p', { class: 'muted' }, 'バックアップはまだありません。'));
+            b.kind === 'preservation' ? null : h('button', { class: 'btn btn-sm', onclick: () => void prepRestore({ backupName: b.name }) }, 'この時点に復元'))))))) : h('p', { class: 'muted' }, 'バックアップはまだありません。'));
     } catch (e) { list.replaceChildren(h('div', { class: 'error-box' }, (e as Error).message)); }
   };
   const prepRestore = async (src: { backupName?: string; file?: File }) => {

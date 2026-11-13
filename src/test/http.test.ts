@@ -61,6 +61,27 @@ async function setup(userId = 'taro') {
   return { ...t, req, done, logs, inboxDir, otherPc };
 }
 
+test('自動バックアップの残留ロックを状態APIで画面へ通知する', async t => {
+  const { store, dataDir, req, done } = await setup();
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (line: string) => { errors.push(line); });
+  try {
+    const lock = path.join(dataDir, 'locks/jobs.lock');
+    await fs.writeFile(lock, '{}');
+    const old = new Date(Date.now() - 60000); await fs.utimes(lock, old, old);
+    await assert.rejects(store.autoBackup(24, 14));
+    const result = await req('GET', '/api/status');
+    assert.equal(result.status, 200);
+    assert.match((result.json.storage as { backupError: string }).backupError, /残留ロック/);
+    assert.ok(errors.some(line => line.includes('auto backup stopped') && line.includes('STALE_LOCK')));
+    const manual = await req('POST', '/api/backups');
+    assert.equal(manual.status, 503);
+    await fs.unlink(lock);
+    await store.autoBackup(24, 14);
+    assert.equal(((await req('GET', '/api/status')).json.storage as { backupError: string }).backupError, '');
+  } finally { await done(); }
+});
+
 test('CSRF ヘッダー必須・静的ファイルのパス制限・画像フォルダは静的公開しない', async () => {
   const s = await setup();
   try {
