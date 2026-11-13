@@ -49,3 +49,29 @@ test('AI専用フォームから直接登録：画像（JPEG/PDF）・分類の�
   assert.equal(again[0]!.duplicates!.length, 1);
   await store.close();
 });
+
+test('切り抜き・回転：範囲の検証、表裏それぞれに指定、試し実行で確認用画像を書き出す', async () => {
+  const { store, root } = await tempStore();
+  const formDir = path.join(root, 'ai');
+  await fs.mkdir(formDir);
+  await fs.writeFile(path.join(formDir, 'photo.jpg'), jpegWithSize(3000, 2000));
+  const calls: unknown[] = [];
+  const transform = async (jobs: { data: Buffer; crop?: unknown; rotate?: number }[]) => { calls.push(jobs.map((j) => ({ crop: j.crop, rotate: j.rotate }))); return jobs.map(() => jpegWithSize(1600, 1000)); };
+  const base = { company: '架空商事', frontImageFile: 'photo.jpg', backImageFile: 'photo.jpg' };
+  const bad = await aiImport(store, [
+    { ...base, frontCrop: { left: 0.5, top: 0, width: 0.8, height: 0.5 } },
+    { ...base, frontRotate: 45 },
+    { ...base, frontCrop: { left: 0.1, top: 0.1, width: 0.5 } },
+  ], { baseDir: formDir, user: 'u', transform, dryRun: true });
+  assert.ok(bad.every((r) => !r.ok));
+  const preview = path.join(root, 'preview');
+  const ok = await aiImport(store, { ...base, frontCrop: { left: 0.1, top: 0.2, width: 0.8, height: 0.6 }, frontRotate: 90 },
+    { baseDir: formDir, user: 'u', transform, dryRun: true, previewDir: preview });
+  assert.equal(ok[0]!.ok, true);
+  assert.deepEqual(calls.at(-1), [{ crop: { left: 0.1, top: 0.2, width: 0.8, height: 0.6 }, rotate: 90 }, { crop: undefined, rotate: undefined }]);
+  assert.deepEqual((await fs.readdir(preview)).sort(), ['1-back.jpg', '1-front.jpg']);
+  assert.equal(store.list().length, 0, '試し実行では登録しない');
+  const none = await aiImport(store, { ...base, frontRotate: 180 }, { baseDir: formDir, user: 'u' });
+  assert.match(none[0]!.error!, /画像処理/);
+  await store.close();
+});

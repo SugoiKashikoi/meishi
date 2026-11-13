@@ -35,8 +35,32 @@ export const AI_FORM_TEMPLATE = {
   tags: ['タグ（任意）'],
   memo: 'メモ（話した内容など。名刺から読めない情報は書かない）',
   frontImageFile: '表面の画像ファイルのパス（JPEG または PDF。PDF なら1ページ目＝表、2ページ目＝裏）',
+  frontCrop: { left: 0.1, top: 0.2, width: 0.8, height: 0.55 },
+  frontRotate: 0,
   backImageFile: '裏面の画像ファイルのパス（任意）',
+  backCrop: null,
+  backRotate: 0,
 };
+
+export interface Crop { left: number; top: number; width: number; height: number }
+/** 切り抜き・回転を行う関数（CLI では Electron の画像処理を呼ぶ） */
+export type ImageTransform = (jobs: { data: Buffer; crop?: Crop; rotate?: number }[]) => Promise<Buffer[]>;
+
+function parseCrop(v: unknown, label: string): Crop | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
+  const c = v as Record<string, unknown>;
+  const n = (k: string) => (typeof c[k] === 'number' ? (c[k] as number) : NaN);
+  const crop = { left: n('left'), top: n('top'), width: n('width'), height: n('height') };
+  const ok = Object.values(crop).every((x) => Number.isFinite(x)) && crop.left >= 0 && crop.top >= 0 && crop.width > 0.05 && crop.height > 0.05
+    && crop.left + crop.width <= 1.0001 && crop.top + crop.height <= 1.0001;
+  if (!ok) throw new ValidationError(`${label}の切り抜き範囲が不正です（left/top/width/height を 0〜1 の割合で、画像の内側に収まるように指定）。`);
+  return crop;
+}
+function parseRotate(v: unknown, label: string): number | undefined {
+  if (v === undefined || v === null || v === '' || v === 0) return undefined;
+  if (![90, 180, 270].includes(v as number)) throw new ValidationError(`${label}の回転は 0・90・180・270 のいずれかにしてください（時計回り）。`);
+  return v as number;
+}
 
 export interface AiImportResult {
   index: number;
@@ -61,7 +85,7 @@ async function loadImages(file: string): Promise<Buffer[]> {
 export async function aiImport(
   store: Store,
   input: unknown,
-  opts: { baseDir: string; user: string; inbox?: Inbox; dryRun?: boolean },
+  opts: { baseDir: string; user: string; inbox?: Inbox; dryRun?: boolean; transform?: ImageTransform; previewDir?: string },
 ): Promise<AiImportResult[]> {
   const entries = Array.isArray(input) ? input : [input];
   const results: AiImportResult[] = [];
@@ -80,12 +104,26 @@ export async function aiImport(
       // 画像
       const files = (['frontImageFile', 'backImageFile'] as const)
         .map((k) => (typeof e[k] === 'string' && e[k] ? path.resolve(opts.baseDir, e[k] as string) : null));
-      const imgs: Buffer[] = [];
+      let imgs: Buffer[] = [];
       for (const f of files) if (f) imgs.push(...(await loadImages(f)));
+      imgs = imgs.slice(0, 2);
+      // 名刺部分だけの切り抜き・回転（1枚目＝表、2枚目＝裏）
+      const edits = [
+        { crop: parseCrop(e.frontCrop, '表面'), rotate: parseRotate(e.frontRotate, '表面') },
+        { crop: parseCrop(e.backCrop, '裏面'), rotate: parseRotate(e.backRotate, '裏面') },
+      ];
+      if (imgs.some((_, n) => edits[n]!.crop || edits[n]!.rotate)) {
+        if (!opts.transform) throw new ValidationError('切り抜き・回転を行う画像処理が使えません。');
+        imgs = await opts.transform(imgs.map((data, n) => ({ data, crop: edits[n]!.crop, rotate: edits[n]!.rotate })));
+      }
+      if (opts.previewDir) {
+        await fs.mkdir(opts.previewDir, { recursive: true });
+        for (let n = 0; n < imgs.length; n++) await fs.writeFile(path.join(opts.previewDir, `${i + 1}-${n === 0 ? 'front' : 'back'}.jpg`), imgs[n]!);
+      }
       const dups = store.duplicates(fields).map((c) => ({ id: c.id, company: c.company, name: c.name }));
       if (opts.dryRun) { results.push({ index: i, ok: true, label, duplicates: dups }); continue; }
       const ids: string[] = [];
-      for (const b of imgs.slice(0, 2)) ids.push(await store.putImage(b));
+      for (const b of imgs) ids.push(await store.putImage(b));
       fields.frontImage = ids[0] ?? null;
       fields.backImage = ids[1] ?? null;
       // 取り込み用フォルダの画像なら、他の PC との二重登録を防いだうえで取り込み済みへ移動
